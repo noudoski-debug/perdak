@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DB_PATH = Path(os.environ.get("ENDLC_DB_PATH", str(Path(__file__).resolve().parent / "endldlc.sqlite3")))
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "")
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%")
 ALLOWED_DURATIONS = {7, 14, 20, 30, 60, 90, 180, 360}
 
 app = FastAPI(title="EncoreDLC License API", version="1.0.0")
