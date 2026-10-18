@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -15,7 +16,7 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DB_PATH = Path(os.environ.get("ENDLC_DB_PATH", str(Path(__file__).resolve().parent / "endldlc.sqlite3")))
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%")
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "admin")
 ALLOWED_DURATIONS = {7, 14, 20, 30, 60, 90, 180, 360}
 
 app = FastAPI(title="EncoreDLC License API", version="1.0.0")
@@ -88,6 +89,7 @@ class CreateKeyRequest(BaseModel):
     duration_days: Optional[int] = None
     label: str = Field(default="", max_length=200)
     shared: bool = False
+    custom_key: Optional[str] = Field(default=None, min_length=4, max_length=100)
 
 
 @app.on_event("startup")
@@ -165,17 +167,20 @@ def create_key(body: CreateKeyRequest, x_admin_token: Optional[str] = Header(def
     if body.duration_days is not None and body.duration_days not in ALLOWED_DURATIONS:
         raise HTTPException(status_code=400, detail="duration_days must be 7, 14, 20, 30, 60, 90, 180, 360 or null for lifetime")
     expires = utc_now() + timedelta(days=body.duration_days) if body.duration_days else None
+    custom_key = body.custom_key.strip() if body.custom_key else ""
+    if custom_key and not re.fullmatch(r"[A-Za-z0-9_-]{4,100}", custom_key):
+        raise HTTPException(status_code=400, detail="Custom key may contain only A-Z, a-z, 0-9, underscore and hyphen (4-100 chars)")
+    key = custom_key or generate_key()
     with connect() as con:
-        for _ in range(10):
-            key = generate_key()
-            try:
-                cur = con.execute(
-                    "INSERT INTO licenses (license_key, created_at, expires_at, label, shared) VALUES (?, ?, ?, ?, ?)",
-                    (key, utc_now().isoformat(), to_iso(expires), body.label.strip(), int(body.shared)),
-                )
-                return {"id": cur.lastrowid, "key": key, "created_at": utc_now().isoformat(), "expires_at": to_iso(expires), "label": body.label}
-            except sqlite3.IntegrityError:
-                continue
+        try:
+            cur = con.execute(
+                "INSERT INTO licenses (license_key, created_at, expires_at, label, shared) VALUES (?, ?, ?, ?, ?)",
+                (key, utc_now().isoformat(), to_iso(expires), body.label.strip(), int(body.shared)),
+            )
+            return {"id": cur.lastrowid, "key": key, "created_at": utc_now().isoformat(), "expires_at": to_iso(expires), "label": body.label}
+        except sqlite3.IntegrityError:
+            if custom_key:
+                raise HTTPException(status_code=409, detail="This custom key already exists")
     raise HTTPException(status_code=500, detail="Could not generate unique key")
 
 
