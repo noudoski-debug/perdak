@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
 ONLINE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_ONLINE_WINDOW_SECONDS", "150")))
 _failed_attempts = defaultdict(deque)
 _failed_lock = threading.Lock()
