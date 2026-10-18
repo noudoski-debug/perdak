@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EncoreDLC — Access</title>
+<style>
+:root{color-scheme:dark;--bg:#090b12;--panel:#111522;--line:#272d42;--muted:#8c96b4;--text:#f3f5ff;--accent:#9a7bff;--accent2:#5de1c3}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% 0%,#27204a 0,transparent 45%),var(--bg);font:15px Inter,system-ui,sans-serif;color:var(--text);display:grid;place-items:center;padding:22px}
+.card{width:min(100%,440px);background:linear-gradient(160deg,#151a2a,#0e111b);border:1px solid #30364e;border-radius:26px;padding:28px;box-shadow:0 30px 100px #0009}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:26px}.logo{width:46px;height:46px;border-radius:15px;background:linear-gradient(135deg,var(--accent),#5b4bd8);display:grid;place-items:center;font-weight:900;font-size:21px;box-shadow:0 8px 30px #8266ff55}.brand b{font-size:20px;letter-spacing:.5px}.brand small{display:block;color:var(--muted);margin-top:3px}.eyebrow{color:var(--accent2);font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:800}.title{font-size:28px;margin:8px 0}.sub{color:var(--muted);line-height:1.5;margin:0 0 22px}
+.field{display:flex;gap:8px;background:#090c14;border:1px solid var(--line);padding:7px;border-radius:14px}.field input{width:100%;min-width:0;background:transparent;border:0;outline:0;color:white;padding:10px;font-size:16px;letter-spacing:1px}.field button{border:0;border-radius:10px;background:#252b40;color:#dfe3ff;padding:0 12px;cursor:pointer}
+.keys{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}.key{height:45px;background:#191e2e;border:1px solid #2a3045;color:#e9eaff;border-radius:11px;font-size:16px;cursor:pointer}.key:active{transform:scale(.97);background:#302957}.key.alt{color:#c2b6ff}.actions{display:flex;gap:10px;margin-top:15px}.submit{flex:1;border:0;border-radius:13px;background:linear-gradient(100deg,#9a7bff,#6b62e8);color:white;font-weight:800;padding:14px;cursor:pointer}.clear{border:1px solid var(--line);border-radius:13px;background:#171b29;color:#c9cee2;padding:0 16px;cursor:pointer}.status{min-height:22px;margin-top:15px;color:var(--muted);font-size:13px}.foot{display:flex;justify-content:space-between;border-top:1px solid #252a3c;padding-top:17px;margin-top:16px;color:#707b99;font-size:11px}
+</style>
+</head>
+<body><main class="card">
+<div class="brand"><div class="logo">E</div><div><b>EncoreDLC</b><small>LICENSE PORTAL · v1.0</small></div></div>
+<div class="eyebrow">SECURE ACCESS</div><h1 class="title">Enter your key</h1><p class="sub">Введите лицензионный ключ, чтобы проверить доступ к приложению.</p>
+<div class="field"><input id="license" placeholder="XXXX-XXXX-XXXX" autocomplete="off" maxlength="100"><button id="back" title="Удалить символ">⌫</button></div>
+<div class="keys" id="keyboard"></div>
+<div class="actions"><button class="submit" id="check">ПРОВЕРИТЬ КЛЮЧ</button><button class="clear" id="clear">Очистить</button></div>
+<div class="status" id="status">Для локального демо ключ: 1234567</div>
+<div class="foot"><span>ENCORE DLC</span><span>LICENSE CHECK</span></div>
+</main>
+<script>
+const input=document.querySelector('#license'), status=document.querySelector('#status');
+const chars=['1','2','3','4','5','6','7','8','9','0','-','⌫'];
+const kb=document.querySelector('#keyboard');
+chars.forEach(ch=>{const b=document.createElement('button');b.className='key'+(ch==='⌫'?' alt':'');b.textContent=ch;b.onclick=()=>{if(ch==='⌫')input.value=input.value.slice(0,-1);else input.value+=ch;input.focus()};kb.appendChild(b)});
+document.querySelector('#back').onclick=()=>input.value=input.value.slice(0,-1);
+document.querySelector('#clear').onclick=()=>{input.value='';status.textContent='Введите ключ для проверки.'};
+document.querySelector('#check').onclick=async()=>{
+ const key=input.value.trim();if(!key){status.textContent='Введите ключ.';return}
+ status.textContent='Проверяем ключ…';
+ const device_id=localStorage.getItem('endldlc-device')||('web-'+crypto.randomUUID());
+ localStorage.setItem('endldlc-device',device_id);
+ try{const r=await fetch('/api/v1/license/validate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,device_id})});const d=await r.json();
+ if(d.valid){status.textContent='Доступ подтверждён'+(d.expires_at?' · до '+new Date(d.expires_at).toLocaleString():' · навсегда');status.style.color='#5de1c3'}
+ else{status.textContent='Доступ отклонён: '+(d.reason||d.detail||'ошибка');status.style.color='#ff8d9a'}
+ }catch(e){status.textContent='Нет соединения с сервером лицензий.';status.style.color='#ff8d9a'}
+};
+</script></body></html>
