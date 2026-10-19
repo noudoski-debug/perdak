@@ -38,13 +38,13 @@ ALLOWED_DURATIONS = {1, 3, 7, 14, 20, 30, 60, 90, 180, 360}
 
 # ── защита клиента ──
 # 1 = требовать от клиента build_hash + подпись (включать ПОСЛЕ выпуска обновлённого клиента)
-ENFORCE_CLIENT = os.environ.get("ENDLC_ENFORCE_CLIENT", "0") == "1"
+ENFORCE_CLIENT = os.environ.get("ENDLC_ENFORCE_CLIENT", "1") == "1"
 # общий секрет для HMAC-подписи запроса (зашивается в клиент при сборке)
 CLIENT_HMAC_KEY = os.environ.get("ENDLC_CLIENT_HMAC_KEY", "A2mzpAVFXIkc37yRVWGB7NHkr").strip()
 # белый список официальных билдов (sha256), через запятую; плюс можно добавлять через /admin/builds
 ENV_BUILDS = {x.strip().lower() for x in os.environ.get("ENDLC_OFFICIAL_BUILDS", "").split(",") if x.strip()}
 # 1 = автоматически банить устройство при поддельном/неофициальном клиенте
-AUTOBAN = os.environ.get("ENDLC_AUTOBAN", "0") == "1"
+AUTOBAN = os.environ.get("ENDLC_AUTOBAN", "1") == "1"
 
 app = FastAPI(title="EncoreDLC License API", version="2.0.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
