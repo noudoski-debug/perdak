@@ -25,12 +25,12 @@ from cryptography.hazmat.primitives import serialization
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
 TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
-SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "YkX641z15z2e22MtNJ3AfDriPJXGwEW5U9sLwcqjg5o").strip()
+SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
 RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
-RATE_MAX_IP = max(5, int(os.environ.get("ENDLC_RATE_MAX_IP", "120")))
-RATE_MAX_KEY = max(3, int(os.environ.get("ENDLC_RATE_MAX_KEY", "60")))
+RATE_MAX_IP = max(5, int(os.environ.get("ENDLC_RATE_MAX_IP", "30")))
+RATE_MAX_KEY = max(3, int(os.environ.get("ENDLC_RATE_MAX_KEY", "10")))
 ONLINE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_ONLINE_WINDOW_SECONDS", "150")))
 _failed_attempts = defaultdict(deque)
 _failed_lock = threading.Lock()
@@ -363,7 +363,7 @@ REPORT_KINDS = {"tamper", "debugger", "hook", "integrity", "unofficial_build"}
 
 @app.post("/api/v1/license/report")
 def client_report(body: ReportRequest, request: Request, authorization: Optional[str] = Header(default=None)) -> dict:
-    """Record a client signal for review; do not terminate sessions automatically."""
+    """Клиент сообщает о вмешательстве. Сессия сразу обрывается, админу уходит тревога."""
     license_id, device_hash = parse_bearer(authorization)
     kind = body.kind if body.kind in REPORT_KINDS else "tamper"
     with connect() as con:
@@ -372,9 +372,11 @@ def client_report(body: ReportRequest, request: Request, authorization: Optional
             return {"ok": True, "action": "terminate"}
         allowlisted = con.execute("SELECT 1 FROM whitelisted_devices WHERE device_hash = %s", (device_hash,)).fetchone() is not None
         raise_alert(con, request, kind, row, device_hash, body.build_hash, body.client_version, body.detail)
-        # Keep the alert for the Telegram bot/admin review. A client-side heuristic
-        # is not enough evidence to revoke a session or ban a device automatically.
-    return {"ok": True, "action": "continue"}
+        if not allowlisted:
+            kick_license(con, license_id)
+            if AUTOBAN:
+                ban_device(con, device_hash, f"client report: {kind}", license_id)
+    return {"ok": True, "action": "terminate"}
 
 
 @app.get("/api/v1/admin/alerts")
@@ -536,9 +538,7 @@ def check_license_key(body: dict, request: Request) -> dict:
     """Read-only portal check. Does not activate/bind a device or issue a client token."""
     raw_key = body.get("key", "") if isinstance(body, dict) else ""
     key = str(raw_key).strip()
-    key = key.upper()
-    valid_format = (key.isdigit() and 1 <= len(key) <= 12) or bool(re.fullmatch(r"ENDLC(?:-[A-Z0-9]{4}){3}", key))
-    if not valid_format:
+    if not key.isdigit() or not (1 <= len(key) <= 12):
         return {"valid": False, "reason": "invalid_format"}
     with connect() as con:
         enforce_validate_rate_limit(con, request, key)
