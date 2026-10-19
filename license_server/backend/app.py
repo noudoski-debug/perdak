@@ -218,8 +218,8 @@ def enforce_validate_rate_limit(con, request: Request, key: str) -> None:
 
 
 def generate_key() -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "ENDLC-" + "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3))
+    # Numeric-only keys; zero-padding preserves a fixed 10-digit format.
+    return f"{secrets.randbelow(10**10):010d}"
 
 
 class ValidateRequest(BaseModel):
@@ -498,6 +498,30 @@ def license_public_key() -> dict:
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw)
     return {"algorithm": "Ed25519", "public_key_b64url": b64u(pub)}
+
+
+@app.post("/api/v1/license/check")
+def check_license_key(body: dict, request: Request) -> dict:
+    """Read-only portal check. Does not activate/bind a device or issue a client token."""
+    raw_key = body.get("key", "") if isinstance(body, dict) else ""
+    key = str(raw_key).strip()
+    if not key.isdigit() or not (1 <= len(key) <= 12):
+        return {"valid": False, "reason": "invalid_format"}
+    with connect() as con:
+        enforce_validate_rate_limit(con, request, key)
+        row = con.execute("SELECT id, expires_at, revoked FROM licenses WHERE license_key = %s", (key,)).fetchone()
+        if row is None:
+            security_event(con, request, "validate_denied", key, detail="portal key check: invalid key")
+            return {"valid": False, "reason": "invalid_key"}
+        if row["revoked"]:
+            security_event(con, request, "validate_denied", key, detail="portal key check: revoked")
+            return {"valid": False, "reason": "revoked"}
+        expires = parse_dt(row["expires_at"])
+        if expires and utc_now() >= expires:
+            security_event(con, request, "validate_denied", key, detail="portal key check: expired")
+            return {"valid": False, "reason": "expired"}
+        security_event(con, request, "validate_success", key, detail="portal status check only; no activation")
+        return {"valid": True, "expires_at": row["expires_at"], "activation_required": True}
 
 
 @app.post("/api/v1/license/validate")
