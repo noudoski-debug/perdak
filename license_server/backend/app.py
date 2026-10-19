@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import serialization
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
 TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
 RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
@@ -40,7 +40,7 @@ ALLOWED_DURATIONS = {1, 3, 7, 14, 20, 30, 60, 90, 180, 360}
 # 1 = требовать от клиента build_hash + подпись (включать ПОСЛЕ выпуска обновлённого клиента)
 ENFORCE_CLIENT = os.environ.get("ENDLC_ENFORCE_CLIENT", "0") == "1"
 # общий секрет для HMAC-подписи запроса (зашивается в клиент при сборке)
-CLIENT_HMAC_KEY = os.environ.get("ENDLC_CLIENT_HMAC_KEY", "").strip()
+CLIENT_HMAC_KEY = os.environ.get("ENDLC_CLIENT_HMAC_KEY", "A2mzpAVFXIkc37yRVWGB7NHkr").strip()
 # белый список официальных билдов (sha256), через запятую; плюс можно добавлять через /admin/builds
 ENV_BUILDS = {x.strip().lower() for x in os.environ.get("ENDLC_OFFICIAL_BUILDS", "").split(",") if x.strip()}
 # 1 = автоматически банить устройство при поддельном/неофициальном клиенте
