@@ -4,6 +4,10 @@ import os
 import secrets
 import time
 import threading
+import base64
+import json
+import hashlib
+import hmac
 from collections import defaultdict, deque
 import psycopg
 from psycopg.rows import dict_row
@@ -15,15 +19,32 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
+TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
+SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
+RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
+RATE_MAX_IP = max(5, int(os.environ.get("ENDLC_RATE_MAX_IP", "30")))
+RATE_MAX_KEY = max(3, int(os.environ.get("ENDLC_RATE_MAX_KEY", "10")))
 ONLINE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_ONLINE_WINDOW_SECONDS", "150")))
 _failed_attempts = defaultdict(deque)
 _failed_lock = threading.Lock()
-ALLOWED_DURATIONS = {7, 14, 20, 30, 60, 90, 180, 360}
+ALLOWED_DURATIONS = {1, 3, 7, 14, 20, 30, 60, 90, 180, 360}
+
+# ── защита клиента ──
+# 1 = требовать от клиента build_hash + подпись (включать ПОСЛЕ выпуска обновлённого клиента)
+ENFORCE_CLIENT = os.environ.get("ENDLC_ENFORCE_CLIENT", "0") == "1"
+# общий секрет для HMAC-подписи запроса (зашивается в клиент при сборке)
+CLIENT_HMAC_KEY = os.environ.get("ENDLC_CLIENT_HMAC_KEY", "").strip()
+# белый список официальных билдов (sha256), через запятую; плюс можно добавлять через /admin/builds
+ENV_BUILDS = {x.strip().lower() for x in os.environ.get("ENDLC_OFFICIAL_BUILDS", "").split(",") if x.strip()}
+# 1 = автоматически банить устройство при поддельном/неофициальном клиенте
+AUTOBAN = os.environ.get("ENDLC_AUTOBAN", "0") == "1"
 
 app = FastAPI(title="EncoreDLC License API", version="2.0.0", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
@@ -69,6 +90,25 @@ def init_db() -> None:
         con.execute("""CREATE TABLE IF NOT EXISTS admin_audit (
             id BIGSERIAL PRIMARY KEY, created_at TEXT NOT NULL, action TEXT NOT NULL,
             license_id BIGINT, detail TEXT NOT NULL DEFAULT '', remote_ip TEXT NOT NULL DEFAULT '')""")
+        con.execute("""CREATE TABLE IF NOT EXISTS security_events (
+            id BIGSERIAL PRIMARY KEY, created_at TEXT NOT NULL, event TEXT NOT NULL,
+            ip_hash TEXT NOT NULL, key_hash TEXT NOT NULL DEFAULT '', device_hash TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '')""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_security_events_time ON security_events(created_at)")
+        con.execute("""CREATE TABLE IF NOT EXISTS official_builds (
+            build_hash TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS banned_devices (
+            device_hash TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', license_id BIGINT, created_at TEXT NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS challenges (
+            nonce TEXT PRIMARY KEY, device_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS alerts (
+            id BIGSERIAL PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, license_id BIGINT,
+            label TEXT NOT NULL DEFAULT '', key_masked TEXT NOT NULL DEFAULT '', device_hash TEXT NOT NULL DEFAULT '',
+            build_hash TEXT NOT NULL DEFAULT '', client_version TEXT NOT NULL DEFAULT '', ip_hash TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '', handled INTEGER NOT NULL DEFAULT 0)""")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_alerts_dedupe ON alerts(kind, device_hash, created_at)")
+
 
 
 def require_admin(token: Optional[str], request: Request) -> None:
@@ -120,6 +160,63 @@ async def security_headers(request: Request, call_next):
     return response
 
 
+def b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def signing_key() -> Ed25519PrivateKey:
+    # Must be supplied as base64url/base64 raw 32-byte Ed25519 private key.
+    if not SIGNING_PRIVATE_KEY_B64:
+        raise HTTPException(status_code=503, detail="License signing is not configured")
+    try:
+        raw = base64.urlsafe_b64decode(SIGNING_PRIVATE_KEY_B64 + "=" * (-len(SIGNING_PRIVATE_KEY_B64) % 4))
+        if len(raw) != 32:
+            raise ValueError("expected 32 raw bytes")
+        return Ed25519PrivateKey.from_private_bytes(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Invalid license signing key configuration") from exc
+
+
+def issue_token(license_id: int, device_id: str, expires_at: Optional[str]) -> str:
+    now = int(time.time())
+    claims = {"iss": "EncoreDLC", "aud": "EncoreDLC-client", "sub": str(license_id),
+              "did": hashlib.sha256(device_id.encode()).hexdigest(),
+              "iat": now, "nbf": now, "exp": now + TOKEN_TTL_SECONDS,
+              "license_exp": expires_at}
+    header = {"alg": "EdDSA", "typ": "JWT"}
+    signing_input = b64u(json.dumps(header, separators=(",", ":"), sort_keys=True).encode()) + "." + b64u(
+        json.dumps(claims, separators=(",", ":"), sort_keys=True).encode())
+    sig = signing_key().sign(signing_input.encode("ascii"))
+    return signing_input + "." + b64u(sig)
+
+
+def security_event(con, request: Request, event: str, key: str = "", device_id: str = "", detail: str = "") -> None:
+    ip = request.client.host if request.client else "unknown"
+    # Hash identifiers in logs; don't store submitted license keys or raw device IDs.
+    con.execute("INSERT INTO security_events (created_at,event,ip_hash,key_hash,device_hash,detail) VALUES (%s,%s,%s,%s,%s,%s)",
+        (utc_now().isoformat(), event, hashlib.sha256(ip.encode()).hexdigest(),
+         hashlib.sha256(key.strip().upper().encode()).hexdigest() if key else "",
+         hashlib.sha256(device_id.encode()).hexdigest() if device_id else "", detail[:250]))
+
+
+def enforce_validate_rate_limit(con, request: Request, key: str) -> None:
+    ip = request.client.host if request.client else "unknown"
+    ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+    key_hash = hashlib.sha256(key.strip().upper().encode()).hexdigest()
+    cutoff = (utc_now() - timedelta(seconds=RATE_WINDOW_SECONDS)).isoformat()
+    row = con.execute("SELECT COUNT(*) AS n FROM security_events WHERE created_at >= %s AND ip_hash = %s AND event = 'validate_attempt'",
+                      (cutoff, ip_hash)).fetchone()
+    if int(row["n"] or 0) >= RATE_MAX_IP:
+        security_event(con, request, "rate_limited_ip", key, detail="license validation rate limit")
+        raise HTTPException(status_code=429, detail="Too many validation attempts; retry later")
+    row = con.execute("SELECT COUNT(*) AS n FROM security_events WHERE created_at >= %s AND key_hash = %s AND event = 'validate_attempt'",
+                      (cutoff, key_hash)).fetchone()
+    if int(row["n"] or 0) >= RATE_MAX_KEY:
+        security_event(con, request, "rate_limited_key", key, detail="license validation rate limit")
+        raise HTTPException(status_code=429, detail="Too many attempts for this key; retry later")
+    security_event(con, request, "validate_attempt", key)
+
+
 def generate_key() -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "ENDLC-" + "-".join("".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3))
@@ -128,12 +225,250 @@ def generate_key() -> str:
 class ValidateRequest(BaseModel):
     key: str = Field(min_length=1, max_length=100)
     device_id: str = Field(min_length=1, max_length=200)
+    client_version: str = Field(default="", max_length=40)
+    build_hash: str = Field(default="", max_length=128)
+    nonce: str = Field(default="", max_length=100)
+    proof: str = Field(default="", max_length=128)
 
 
 class CreateKeyRequest(BaseModel):
     duration_days: Optional[int] = None
     label: str = Field(default="", max_length=200)
     shared: bool = False
+
+
+# ───────────────────────── ЗАЩИТА КЛИЕНТА / ТРЕВОГИ ─────────────────────────
+def dev_hash_of(device_id: str) -> str:
+    return hashlib.sha256(device_id.strip().encode()).hexdigest()
+
+
+def mask_key(k: str) -> str:
+    k = k or ""
+    return (k[:6] + "…" + k[-4:]) if len(k) > 12 else "***"
+
+
+def build_allowed(con, build_hash: str) -> bool:
+    h = build_hash.strip().lower()
+    if h in ENV_BUILDS:
+        return True
+    return con.execute("SELECT 1 FROM official_builds WHERE build_hash = %s AND active = 1", (h,)).fetchone() is not None
+
+
+def kick_license(con, license_id: int) -> None:
+    con.execute("UPDATE licenses SET session_expires_at = NULL WHERE id = %s", (license_id,))
+
+
+def ban_device(con, device_hash: str, reason: str, license_id: Optional[int] = None) -> None:
+    con.execute("""INSERT INTO banned_devices (device_hash, reason, license_id, created_at) VALUES (%s,%s,%s,%s)
+        ON CONFLICT (device_hash) DO NOTHING""", (device_hash, reason[:200], license_id, utc_now().isoformat()))
+    if license_id:
+        kick_license(con, license_id)
+
+
+def raise_alert(con, request: Request, kind: str, row, device_hash: str, build_hash: str = "",
+                client_version: str = "", detail: str = "", window_min: int = 10) -> Optional[int]:
+    """Создаёт тревогу для бота. Одинаковые (kind + устройство) не чаще раза в window_min минут."""
+    cutoff = (utc_now() - timedelta(minutes=window_min)).isoformat()
+    if con.execute("SELECT 1 FROM alerts WHERE kind = %s AND device_hash = %s AND created_at >= %s LIMIT 1",
+                   (kind, device_hash, cutoff)).fetchone():
+        return None
+    ip = request.client.host if request.client else "unknown"
+    r = con.execute("""INSERT INTO alerts (created_at, kind, license_id, label, key_masked, device_hash, build_hash,
+        client_version, ip_hash, detail) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+        (utc_now().isoformat(), kind, row["id"] if row else None, (row["label"] if row else "") or "",
+         mask_key(row["license_key"]) if row else "", device_hash, build_hash[:128], client_version[:40],
+         hashlib.sha256(ip.encode()).hexdigest(), detail[:250])).fetchone()
+    return r["id"]
+
+
+def check_client_integrity(con, body, device_id: str) -> Optional[str]:
+    """None — клиент в порядке; иначе код причины."""
+    if not ENFORCE_CLIENT:
+        return None
+    if not (body.build_hash and body.client_version):
+        return "missing_attestation"
+    if CLIENT_HMAC_KEY:
+        if not body.nonce or not body.proof:
+            return "missing_attestation"
+        used = con.execute("""UPDATE challenges SET used = 1 WHERE nonce = %s AND device_hash = %s
+            AND used = 0 AND expires_at >= %s RETURNING nonce""",
+            (body.nonce, dev_hash_of(device_id), utc_now().isoformat())).fetchone()
+        if not used:
+            return "bad_nonce"
+        msg = f"{body.nonce}|{device_id.strip()}|{body.build_hash.strip().lower()}|{body.client_version}".encode()
+        expected = hmac.new(CLIENT_HMAC_KEY.encode(), msg, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, body.proof.strip().lower()):
+            return "bad_proof"
+    if not build_allowed(con, body.build_hash):
+        return "unofficial_build"
+    return None
+
+
+class ChallengeRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/api/v1/license/challenge")
+def license_challenge(body: ChallengeRequest, request: Request) -> dict:
+    """Клиент берёт одноразовый nonce, подписывает его и отправляет в /validate."""
+    ip = request.client.host if request.client else "unknown"
+    ip_hash = hashlib.sha256(ip.encode()).hexdigest()
+    now = utc_now()
+    with connect() as con:
+        cutoff = (now - timedelta(seconds=RATE_WINDOW_SECONDS)).isoformat()
+        n = con.execute("SELECT COUNT(*) AS n FROM security_events WHERE created_at >= %s AND ip_hash = %s AND event = 'challenge'",
+                        (cutoff, ip_hash)).fetchone()["n"]
+        if int(n or 0) >= RATE_MAX_IP * 3:
+            raise HTTPException(status_code=429, detail="Too many requests")
+        security_event(con, request, "challenge")
+        con.execute("DELETE FROM challenges WHERE expires_at < %s", (now.isoformat(),))
+        nonce = secrets.token_urlsafe(24)
+        con.execute("INSERT INTO challenges (nonce, device_hash, expires_at) VALUES (%s,%s,%s)",
+                    (nonce, dev_hash_of(body.device_id), (now + timedelta(seconds=60)).isoformat()))
+    return {"nonce": nonce, "expires_in": 60}
+
+
+def parse_bearer(authorization: Optional[str]):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    parts = authorization[7:].strip().split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    try:
+        signed = (parts[0] + "." + parts[1]).encode("ascii")
+        signature = base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4))
+        signing_key().public_key().verify(signature, signed)
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        now = int(time.time())
+        if claims.get("iss") != "EncoreDLC" or claims.get("aud") != "EncoreDLC-client":
+            raise ValueError("iss/aud")
+        if int(claims.get("exp", 0)) <= now or int(claims.get("nbf", 0)) > now:
+            raise ValueError("time")
+        return int(claims["sub"]), str(claims["did"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+class ReportRequest(BaseModel):
+    kind: str = Field(min_length=1, max_length=40)
+    detail: str = Field(default="", max_length=200)
+    build_hash: str = Field(default="", max_length=128)
+    client_version: str = Field(default="", max_length=40)
+
+
+REPORT_KINDS = {"tamper", "debugger", "hook", "integrity", "unofficial_build"}
+
+
+@app.post("/api/v1/license/report")
+def client_report(body: ReportRequest, request: Request, authorization: Optional[str] = Header(default=None)) -> dict:
+    """Клиент сообщает о вмешательстве. Сессия сразу обрывается, админу уходит тревога."""
+    license_id, device_hash = parse_bearer(authorization)
+    kind = body.kind if body.kind in REPORT_KINDS else "tamper"
+    with connect() as con:
+        row = con.execute("SELECT id, label, license_key FROM licenses WHERE id = %s", (license_id,)).fetchone()
+        if row is None:
+            return {"ok": True, "action": "terminate"}
+        raise_alert(con, request, kind, row, device_hash, body.build_hash, body.client_version, body.detail)
+        kick_license(con, license_id)
+        if AUTOBAN:
+            ban_device(con, device_hash, f"client report: {kind}", license_id)
+    return {"ok": True, "action": "terminate"}
+
+
+@app.get("/api/v1/admin/alerts")
+def admin_alerts(request: Request, after_id: int = 0, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        rows = con.execute("""SELECT id, created_at, kind, license_id, label, key_masked, device_hash, build_hash,
+            client_version, detail, handled FROM alerts WHERE id > %s ORDER BY id ASC LIMIT 50""", (after_id,)).fetchall()
+    return {"alerts": [dict(r) for r in rows]}
+
+
+@app.post("/api/v1/admin/alerts/{alert_id}/handle")
+def admin_alert_handle(alert_id: int, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        con.execute("UPDATE alerts SET handled = 1 WHERE id = %s", (alert_id,))
+        audit(con, request, "alert_handled", None, f"alert={alert_id}")
+    return {"ok": True}
+
+
+class BanRequest(BaseModel):
+    device_hash: Optional[str] = Field(default=None, max_length=128)
+    license_id: Optional[int] = None
+    reason: str = Field(default="", max_length=200)
+
+
+@app.post("/api/v1/admin/devices/ban")
+def admin_ban_device(body: BanRequest, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        dh = (body.device_hash or "").strip().lower()
+        if not dh and body.license_id:
+            row = con.execute("SELECT device_id FROM licenses WHERE id = %s", (body.license_id,)).fetchone()
+            if row and row["device_id"]:
+                dh = dev_hash_of(row["device_id"])
+        if not dh:
+            raise HTTPException(status_code=400, detail="device_hash or license_id with bound device required")
+        ban_device(con, dh, body.reason or "admin", body.license_id)
+        audit(con, request, "device_banned", body.license_id, f"device={dh[:16]}; reason={body.reason}")
+    return {"ok": True, "device_hash": dh}
+
+
+class UnbanRequest(BaseModel):
+    device_hash: str = Field(min_length=8, max_length=128)
+
+
+@app.post("/api/v1/admin/devices/unban")
+def admin_unban_device(body: UnbanRequest, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        # допускаем префикс хэша (бот показывает короткий вид)
+        cur = con.execute("DELETE FROM banned_devices WHERE device_hash LIKE %s", (body.device_hash.strip().lower() + "%",))
+        audit(con, request, "device_unbanned", None, f"device={body.device_hash[:16]}")
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.get("/api/v1/admin/devices/banned")
+def admin_banned_devices(request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        rows = con.execute("SELECT device_hash, reason, license_id, created_at FROM banned_devices ORDER BY created_at DESC LIMIT 100").fetchall()
+    return {"devices": [dict(r) for r in rows]}
+
+
+class BuildRequest(BaseModel):
+    build_hash: str = Field(min_length=16, max_length=128)
+    version: str = Field(default="", max_length=40)
+    note: str = Field(default="", max_length=200)
+
+
+@app.post("/api/v1/admin/builds")
+def admin_add_build(body: BuildRequest, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        con.execute("""INSERT INTO official_builds (build_hash, version, note, active, created_at) VALUES (%s,%s,%s,1,%s)
+            ON CONFLICT (build_hash) DO UPDATE SET version = EXCLUDED.version, note = EXCLUDED.note, active = 1""",
+            (body.build_hash.strip().lower(), body.version, body.note, utc_now().isoformat()))
+        audit(con, request, "build_added", None, f"{body.version}; {body.build_hash[:16]}")
+    return {"ok": True}
+
+
+@app.get("/api/v1/admin/builds")
+def admin_list_builds(request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        rows = con.execute("SELECT build_hash, version, note, active, created_at FROM official_builds ORDER BY created_at DESC").fetchall()
+    return {"builds": [dict(r) for r in rows], "env_builds": sorted(ENV_BUILDS), "enforce": ENFORCE_CLIENT}
+
+
+@app.post("/api/v1/admin/builds/{build_hash}/deactivate")
+def admin_deactivate_build(build_hash: str, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        cur = con.execute("UPDATE official_builds SET active = 0 WHERE build_hash LIKE %s", (build_hash.strip().lower() + "%",))
+        audit(con, request, "build_deactivated", None, build_hash[:16])
+    return {"ok": True, "updated": cur.rowcount}
 
 
 @app.on_event("startup")
@@ -156,6 +491,15 @@ def health() -> dict:
     return {"ok": True, "service": "EncoreDLC License API"}
 
 
+@app.get("/api/v1/license/public-key")
+def license_public_key() -> dict:
+    # Public key is safe to embed in the native client for offline signature verification.
+    pub = signing_key().public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw)
+    return {"algorithm": "Ed25519", "public_key_b64url": b64u(pub)}
+
+
 @app.post("/api/v1/license/validate")
 def validate_license(body: ValidateRequest, request: Request) -> dict:
     key = body.key.strip()
@@ -163,25 +507,60 @@ def validate_license(body: ValidateRequest, request: Request) -> dict:
     if not key or not device_id:
         raise HTTPException(status_code=400, detail="key and device_id are required")
     with connect() as con:
+        enforce_validate_rate_limit(con, request, key)
+        dev_hash = dev_hash_of(device_id)
+        if con.execute("SELECT 1 FROM banned_devices WHERE device_hash = %s", (dev_hash,)).fetchone():
+            security_event(con, request, "validate_denied", key, device_id, "device banned")
+            brow = con.execute("SELECT id, label, license_key FROM licenses WHERE license_key = %s", (key,)).fetchone()
+            raise_alert(con, request, "banned_device", brow, dev_hash, body.build_hash, body.client_version,
+                        "попытка входа с заблокированного устройства", window_min=60)
+            return {"valid": False, "reason": "device_banned", "kick": True}
         row = con.execute("SELECT * FROM licenses WHERE license_key = %s", (key,)).fetchone()
         if row is None:
+            security_event(con, request, "validate_denied", key, device_id, "invalid key")
             return {"valid": False, "reason": "invalid_key"}
+        bad = check_client_integrity(con, body, device_id)
+        if bad:
+            security_event(con, request, "validate_denied", key, device_id, bad)
+            raise_alert(con, request, bad, row, dev_hash, body.build_hash, body.client_version,
+                        f"{bad}; version={body.client_version[:20] or '-'}")
+            if row["device_id"] == device_id:
+                kick_license(con, row["id"])  # выкидываем активную сессию с этого устройства
+            if AUTOBAN and bad in ("unofficial_build", "bad_proof"):
+                ban_device(con, dev_hash, bad, row["id"])
+            return {"valid": False, "reason": "unofficial_client", "kick": True}
         if row["revoked"]:
+            security_event(con, request, "validate_denied", key, device_id, "revoked")
             return {"valid": False, "reason": "revoked"}
-        expires = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
-        if expires and utc_now() >= expires:
+        expires = parse_dt(row["expires_at"])
+        now = utc_now()
+        if expires and now >= expires:
+            security_event(con, request, "validate_denied", key, device_id, "expired")
             return {"valid": False, "reason": "expired"}
-        # First successful activation binds the key to this device ID.
         if not row["shared"] and row["device_id"] and row["device_id"] != device_id:
+            security_event(con, request, "validate_denied", key, device_id, "device mismatch")
             return {"valid": False, "reason": "device_mismatch"}
         if not row["shared"] and not row["device_id"]:
-            con.execute("UPDATE licenses SET device_id = %s WHERE id = %s", (device_id, row["id"]))
-        # Server-side one-hour session. No session token/expiry is stored on the client.
-        session_expiry = utc_now() + timedelta(hours=1)
-        seen_at = utc_now().isoformat()
-        con.execute("UPDATE licenses SET session_expires_at = %s, last_seen_at = %s WHERE id = %s", (session_expiry.isoformat(), seen_at, row["id"]))
-        con.execute("INSERT INTO client_presence (device_id, license_id, last_seen_at) VALUES (%s, %s, %s) ON CONFLICT (device_id) DO UPDATE SET license_id = EXCLUDED.license_id, last_seen_at = EXCLUDED.last_seen_at", (device_id, row["id"], seen_at))
-        return {"valid": True, "expires_at": row["expires_at"], "session_expires_at": session_expiry.isoformat(), "label": row["label"]}
+            cur = con.execute("UPDATE licenses SET device_id = %s WHERE id = %s AND device_id IS NULL",
+                              (device_id, row["id"]))
+            if cur.rowcount == 0:
+                current = con.execute("SELECT device_id FROM licenses WHERE id = %s", (row["id"],)).fetchone()
+                if current and current["device_id"] != device_id:
+                    security_event(con, request, "validate_denied", key, device_id, "activation race/device mismatch")
+                    return {"valid": False, "reason": "device_mismatch"}
+        session_expiry = now + timedelta(seconds=TOKEN_TTL_SECONDS)
+        seen_at = now.isoformat()
+        con.execute("UPDATE licenses SET session_expires_at = %s, last_seen_at = %s WHERE id = %s",
+                    (session_expiry.isoformat(), seen_at, row["id"]))
+        con.execute("""INSERT INTO client_presence (device_id, license_id, last_seen_at)
+            VALUES (%s, %s, %s) ON CONFLICT (device_id) DO UPDATE SET
+            license_id = EXCLUDED.license_id, last_seen_at = EXCLUDED.last_seen_at""",
+            (device_id, row["id"], seen_at))
+        token = issue_token(int(row["id"]), device_id, row["expires_at"])
+        security_event(con, request, "validate_success", key, device_id, "signed token issued")
+        return {"valid": True, "expires_at": row["expires_at"], "session_expires_at": session_expiry.isoformat(),
+                "token": token, "token_type": "Bearer", "token_expires_in": TOKEN_TTL_SECONDS,
+                "label": row["label"]}
 
 
 class SessionRequest(BaseModel):
@@ -189,24 +568,50 @@ class SessionRequest(BaseModel):
 
 
 @app.post("/api/v1/license/session")
-def check_session(body: SessionRequest) -> dict:
-    device_id = body.device_id.strip()
-    if not device_id:
-        return {"valid": False, "reason": "missing_device"}
-    now = utc_now()
+def check_session(request: Request, authorization: Optional[str] = Header(default=None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Bearer token required")
+    parts = authorization[7:].strip().split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    try:
+        public_key = signing_key().public_key()
+        signed = (parts[0] + "." + parts[1]).encode("ascii")
+        signature = base64.urlsafe_b64decode(parts[2] + "=" * (-len(parts[2]) % 4))
+        public_key.verify(signature, signed)
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        now = int(time.time())
+        if claims.get("iss") != "EncoreDLC" or claims.get("aud") != "EncoreDLC-client":
+            raise ValueError("wrong issuer/audience")
+        if int(claims.get("exp", 0)) <= now or int(claims.get("nbf", 0)) > now:
+            raise ValueError("expired/not-yet-valid")
+        license_id, device_hash = int(claims["sub"]), str(claims["did"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     with connect() as con:
-        row = con.execute("""SELECT * FROM licenses
-            WHERE device_id = %s AND revoked = 0 AND session_expires_at IS NOT NULL
-            ORDER BY id DESC LIMIT 1""", (device_id,)).fetchone()
-        if row is None:
-            return {"valid": False, "reason": "no_session"}
-        expires = datetime.fromisoformat(row["session_expires_at"])
-        license_expires = datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None
-        if now >= expires or (license_expires and now >= license_expires):
-            return {"valid": False, "reason": "session_expired"}
-        con.execute("UPDATE licenses SET last_seen_at = %s WHERE id = %s", (now.isoformat(), row["id"]))
-        con.execute("INSERT INTO client_presence (device_id, license_id, last_seen_at) VALUES (%s, %s, %s) ON CONFLICT (device_id) DO UPDATE SET license_id = EXCLUDED.license_id, last_seen_at = EXCLUDED.last_seen_at", (device_id, row["id"], now.isoformat()))
-        return {"valid": True, "session_expires_at": row["session_expires_at"]}
+        row = con.execute("SELECT * FROM licenses WHERE id = %s", (license_id,)).fetchone()
+        if row is None or row["revoked"]:
+            raise HTTPException(status_code=401, detail="License revoked or unavailable")
+        if con.execute("SELECT 1 FROM banned_devices WHERE device_hash = %s", (device_hash,)).fetchone():
+            raise HTTPException(status_code=401, detail="Device banned")
+        if row["session_expires_at"] is None:
+            raise HTTPException(status_code=401, detail="Session terminated")
+        expiry = parse_dt(row["expires_at"])
+        if expiry and utc_now() >= expiry:
+            raise HTTPException(status_code=401, detail="License expired")
+        if not row["shared"] and (not row["device_id"] or hashlib.sha256(row["device_id"].encode()).hexdigest() != device_hash):
+            raise HTTPException(status_code=401, detail="Device binding mismatch")
+        con.execute("UPDATE licenses SET last_seen_at = %s WHERE id = %s", (utc_now().isoformat(), license_id))
+        return {"valid": True, "license_expires_at": row["expires_at"], "token_expires_at": claims["exp"]}
+
+
+@app.get("/api/v1/admin/security-events")
+def admin_security_events(request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        rows = con.execute("""SELECT id, created_at, event, ip_hash, key_hash, device_hash, detail
+            FROM security_events ORDER BY id DESC LIMIT 200""").fetchall()
+    return {"events": [dict(r) for r in rows]}
 
 
 @app.get("/api/v1/admin/stats")
@@ -253,7 +658,7 @@ def unrevoke_key(license_id: int, request: Request, x_admin_token: Optional[str]
 def create_key(body: CreateKeyRequest, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
     require_admin(x_admin_token, request)
     if body.duration_days is not None and body.duration_days not in ALLOWED_DURATIONS:
-        raise HTTPException(status_code=400, detail="duration_days must be 7, 14, 20, 30, 60, 90, 180, 360 or null for lifetime")
+        raise HTTPException(status_code=400, detail="duration_days must be one of 1, 3, 7, 14, 20, 30, 60, 90, 180, 360 or null for lifetime")
     expires = utc_now() + timedelta(days=body.duration_days) if body.duration_days else None
     with connect() as con:
         for _ in range(10):
