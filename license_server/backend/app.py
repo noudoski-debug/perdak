@@ -100,6 +100,8 @@ def init_db() -> None:
             active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
         con.execute("""CREATE TABLE IF NOT EXISTS banned_devices (
             device_hash TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', license_id BIGINT, created_at TEXT NOT NULL)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS whitelisted_devices (
+            device_hash TEXT PRIMARY KEY, reason TEXT NOT NULL DEFAULT '', license_id BIGINT, created_at TEXT NOT NULL)""")
         con.execute("""CREATE TABLE IF NOT EXISTS challenges (
             nonce TEXT PRIMARY KEY, device_hash TEXT NOT NULL, expires_at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)""")
         con.execute("""CREATE TABLE IF NOT EXISTS alerts (
@@ -218,8 +220,8 @@ def enforce_validate_rate_limit(con, request: Request, key: str) -> None:
 
 
 def generate_key() -> str:
-    # Numeric-only keys; zero-padding preserves a fixed 10-digit format.
-    return f"{secrets.randbelow(10**10):010d}"
+    # Short numeric keys as requested. Keep format compatible with existing numeric-key validation.
+    return f"{secrets.randbelow(10**6):06d}"
 
 
 class ValidateRequest(BaseModel):
@@ -368,10 +370,12 @@ def client_report(body: ReportRequest, request: Request, authorization: Optional
         row = con.execute("SELECT id, label, license_key FROM licenses WHERE id = %s", (license_id,)).fetchone()
         if row is None:
             return {"ok": True, "action": "terminate"}
+        allowlisted = con.execute("SELECT 1 FROM whitelisted_devices WHERE device_hash = %s", (device_hash,)).fetchone() is not None
         raise_alert(con, request, kind, row, device_hash, body.build_hash, body.client_version, body.detail)
-        kick_license(con, license_id)
-        if AUTOBAN:
-            ban_device(con, device_hash, f"client report: {kind}", license_id)
+        if not allowlisted:
+            kick_license(con, license_id)
+            if AUTOBAN:
+                ban_device(con, device_hash, f"client report: {kind}", license_id)
     return {"ok": True, "action": "terminate"}
 
 
@@ -413,6 +417,35 @@ def admin_ban_device(body: BanRequest, request: Request, x_admin_token: Optional
         ban_device(con, dh, body.reason or "admin", body.license_id)
         audit(con, request, "device_banned", body.license_id, f"device={dh[:16]}; reason={body.reason}")
     return {"ok": True, "device_hash": dh}
+
+
+class WhitelistRequest(BaseModel):
+    device_hash: str = Field(min_length=8, max_length=128)
+    license_id: Optional[int] = None
+    reason: str = Field(default="admin-confirmed false positive", max_length=200)
+
+
+@app.post("/api/v1/admin/devices/whitelist")
+def admin_whitelist_device(body: WhitelistRequest, request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    dh = body.device_hash.strip().lower()
+    with connect() as con:
+        con.execute("""INSERT INTO whitelisted_devices (device_hash, reason, license_id, created_at)
+            VALUES (%s,%s,%s,%s) ON CONFLICT (device_hash) DO UPDATE SET reason=EXCLUDED.reason,
+            license_id=COALESCE(EXCLUDED.license_id, whitelisted_devices.license_id)""",
+            (dh, body.reason, body.license_id, utc_now().isoformat()))
+        # A confirmed false positive should restore access if this device was automatically banned.
+        con.execute("DELETE FROM banned_devices WHERE device_hash = %s", (dh,))
+        audit(con, request, "device_whitelisted", body.license_id, f"device={dh[:16]}; reason={body.reason}")
+    return {"ok": True, "device_hash": dh}
+
+
+@app.get("/api/v1/admin/devices/whitelist")
+def admin_list_whitelist(request: Request, x_admin_token: Optional[str] = Header(default=None)) -> dict:
+    require_admin(x_admin_token, request)
+    with connect() as con:
+        rows = con.execute("SELECT device_hash, reason, license_id, created_at FROM whitelisted_devices ORDER BY created_at DESC LIMIT 200").fetchall()
+    return {"devices": [dict(r) for r in rows]}
 
 
 class UnbanRequest(BaseModel):
@@ -533,7 +566,8 @@ def validate_license(body: ValidateRequest, request: Request) -> dict:
     with connect() as con:
         enforce_validate_rate_limit(con, request, key)
         dev_hash = dev_hash_of(device_id)
-        if con.execute("SELECT 1 FROM banned_devices WHERE device_hash = %s", (dev_hash,)).fetchone():
+        allowlisted = con.execute("SELECT 1 FROM whitelisted_devices WHERE device_hash = %s", (dev_hash,)).fetchone() is not None
+        if not allowlisted and con.execute("SELECT 1 FROM banned_devices WHERE device_hash = %s", (dev_hash,)).fetchone():
             security_event(con, request, "validate_denied", key, device_id, "device banned")
             brow = con.execute("SELECT id, label, license_key FROM licenses WHERE license_key = %s", (key,)).fetchone()
             raise_alert(con, request, "banned_device", brow, dev_hash, body.build_hash, body.client_version,
@@ -543,7 +577,8 @@ def validate_license(body: ValidateRequest, request: Request) -> dict:
         if row is None:
             security_event(con, request, "validate_denied", key, device_id, "invalid key")
             return {"valid": False, "reason": "invalid_key"}
-        bad = check_client_integrity(con, body, device_id)
+        # An admin-confirmed false positive suppresses integrity-triggered kicks/bans for this device.
+        bad = None if allowlisted else check_client_integrity(con, body, device_id)
         if bad:
             security_event(con, request, "validate_denied", key, device_id, bad)
             raise_alert(con, request, bad, row, dev_hash, body.build_hash, body.client_version,
@@ -685,7 +720,7 @@ def create_key(body: CreateKeyRequest, request: Request, x_admin_token: Optional
         raise HTTPException(status_code=400, detail="duration_days must be one of 1, 3, 7, 14, 20, 30, 60, 90, 180, 360 or null for lifetime")
     expires = utc_now() + timedelta(days=body.duration_days) if body.duration_days else None
     with connect() as con:
-        for _ in range(10):
+        for _ in range(100):
             key = generate_key()
             try:
                 cur = con.execute(
