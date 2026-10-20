@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import serialization
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
 TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
 RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
@@ -521,7 +521,21 @@ def admin_page() -> str:
 
 @app.get("/api/v1/health")
 def health() -> dict:
-    return {"ok": True, "service": "EncoreDLC License API"}
+    if not DATABASE_URL:
+        raise HTTPException(status_code=503, detail="database_not_configured")
+    try:
+        with connect() as con:
+            con.execute("SELECT 1")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="database_unavailable") from exc
+    if not SIGNING_PRIVATE_KEY_B64:
+        raise HTTPException(status_code=503, detail="signing_key_not_configured")
+    try:
+        signing_key()
+    except HTTPException:
+        raise
+    return {"ok": True, "service": "EncoreDLC License API",
+            "database": "ok", "signing": "configured"}
 
 
 @app.get("/api/v1/license/public-key")
