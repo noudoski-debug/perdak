@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import serialization
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
 TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
 RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
@@ -577,6 +577,8 @@ def validate_license(body: ValidateRequest, request: Request) -> dict:
     device_id = body.device_id.strip()
     if not key or not device_id:
         raise HTTPException(status_code=400, detail="key and device_id are required")
+    if len(key) != 6 or not key.isascii() or not key.isdigit():
+        raise HTTPException(status_code=400, detail="license key must contain exactly 6 digits")
     with connect() as con:
         enforce_validate_rate_limit(con, request, key)
         dev_hash = dev_hash_of(device_id)
