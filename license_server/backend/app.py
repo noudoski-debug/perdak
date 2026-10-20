@@ -24,8 +24,8 @@ from cryptography.hazmat.primitives import serialization
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
-DATABASE_URL = os.environ.get("DATABASE_URL", "DaValhjaDV#$24+%").strip()
-ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+ADMIN_TOKEN = os.environ.get("ENDLC_ADMIN_TOKEN", "DaValhjaDV#$24+%").strip()
 TOKEN_TTL_SECONDS = max(60, min(900, int(os.environ.get("ENDLC_TOKEN_TTL_SECONDS", "300"))))
 SIGNING_PRIVATE_KEY_B64 = os.environ.get("ENDLC_SIGNING_PRIVATE_KEY_B64", "").strip()
 RATE_WINDOW_SECONDS = max(60, int(os.environ.get("ENDLC_RATE_WINDOW_SECONDS", "300")))
