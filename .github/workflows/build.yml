@@ -39,8 +39,8 @@ jobs:
           cat > control <<'EOF'
           Package: com.local.dynisland
           Name: DynIsland
-          Version: 0.1.0
-          Description: Dynamic Island style pill for notch iPhones
+          Version: 0.2.0
+          Description: Always-on Dynamic Island style pill for notch iPhones
           Maintainer: me
           Author: me
           Section: Tweaks
@@ -54,6 +54,10 @@ jobs:
           cat > Tweak.x <<'EOF'
           #import <UIKit/UIKit.h>
           #import <dlfcn.h>
+
+          // Distance from the top of the screen to the island (tweak to taste)
+          #define DI_TOP_NOTCH 22.0
+          #define DI_TOP_FLAT  8.0
 
           @interface SpringBoard : UIApplication
           @end
@@ -74,15 +78,28 @@ jobs:
           typedef void (*DIRegisterFn)(dispatch_queue_t queue);
           typedef void (*DIGetInfoFn)(dispatch_queue_t queue, DIInfoBlock block);
 
+          typedef NS_ENUM(NSInteger, DIMode) {
+              DIModeIdle,      // small always-visible pill
+              DIModeCompact,   // pill with red dot + timer (recording)
+              DIModeExpanded   // big pill with icon / title / subtitle
+          };
+
           @interface DIController : NSObject
           @property (nonatomic, strong) DIWindow *window;
           @property (nonatomic, strong) UIView *pill;
+          @property (nonatomic, strong) UIView *dot;
           @property (nonatomic, strong) UILabel *iconLabel;
           @property (nonatomic, strong) UILabel *titleLabel;
           @property (nonatomic, strong) UILabel *subLabel;
+          @property (nonatomic, strong) UILabel *timerLabel;
           @property (nonatomic, copy) NSString *lastTrack;
           @property (nonatomic, assign) UIDeviceBatteryState lastState;
           @property (nonatomic, assign) NSInteger token;
+          @property (nonatomic, assign) DIMode mode;
+          @property (nonatomic, assign) BOOL recording;
+          @property (nonatomic, strong) NSDate *recStart;
+          @property (nonatomic, strong) NSTimer *recTimer;
+          @property (nonatomic, assign) CGFloat top;
           + (instancetype)shared;
           - (void)start;
           @end
@@ -94,6 +111,17 @@ jobs:
               static dispatch_once_t once;
               dispatch_once(&once, ^{ c = [DIController new]; });
               return c;
+          }
+
+          - (CGRect)frameForMode:(DIMode)m {
+              CGFloat W = UIScreen.mainScreen.bounds.size.width;
+              CGSize s;
+              switch (m) {
+                  case DIModeIdle:     s = CGSizeMake(126, 37); break;
+                  case DIModeCompact:  s = CGSizeMake(170, 37); break;
+                  default:             s = CGSizeMake(330, 66); break;
+              }
+              return CGRectMake((W - s.width) / 2, self.top, s.width, s.height);
           }
 
           - (void)start {
@@ -115,41 +143,63 @@ jobs:
               w.hidden = NO;
               self.window = w;
 
-              CGFloat width = 300, height = 44;
-              CGFloat top = (bounds.size.height >= 812) ? 36 : 12; // just under the notch
+              self.top = (bounds.size.height >= 812) ? DI_TOP_NOTCH : DI_TOP_FLAT;
 
-              UIView *pill = [[UIView alloc] initWithFrame:CGRectMake((bounds.size.width - width) / 2, top, width, height)];
+              CGRect f = [self frameForMode:DIModeIdle];
+              UIView *pill = [[UIView alloc] initWithFrame:f];
               pill.backgroundColor = UIColor.blackColor;
-              pill.layer.cornerRadius = height / 2;
-              pill.layer.shadowColor = UIColor.blackColor.CGColor;
-              pill.layer.shadowOpacity = 0.4;
-              pill.layer.shadowRadius = 8;
-              pill.layer.shadowOffset = CGSizeMake(0, 3);
-              pill.alpha = 0;
-              pill.transform = CGAffineTransformMakeScale(0.4, 0.6);
+              pill.layer.cornerRadius = f.size.height / 2;
+              if (@available(iOS 13.0, *)) pill.layer.cornerCurve = kCACornerCurveContinuous;
               [vc.view addSubview:pill];
               self.pill = pill;
 
-              UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, 28, height)];
-              icon.font = [UIFont systemFontOfSize:20];
+              UIView *dot = [UIView new];
+              dot.backgroundColor = [UIColor colorWithRed:1 green:0.23 blue:0.19 alpha:1];
+              dot.layer.cornerRadius = 5;
+              dot.alpha = 0;
+              [pill addSubview:dot];
+              self.dot = dot;
+
+              CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"opacity"];
+              pulse.fromValue = @1; pulse.toValue = @0.35;
+              pulse.duration = 0.8; pulse.autoreverses = YES;
+              pulse.repeatCount = HUGE_VALF;
+              [dot.layer addAnimation:pulse forKey:@"pulse"];
+
+              UILabel *icon = [UILabel new];
+              icon.font = [UIFont systemFontOfSize:22];
               icon.textAlignment = NSTextAlignmentCenter;
+              icon.alpha = 0;
               [pill addSubview:icon];
               self.iconLabel = icon;
 
-              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(50, 5, width - 66, 18)];
-              title.font = [UIFont boldSystemFontOfSize:14];
+              UILabel *title = [UILabel new];
+              title.font = [UIFont boldSystemFontOfSize:15];
               title.textColor = UIColor.whiteColor;
+              title.alpha = 0;
               [pill addSubview:title];
               self.titleLabel = title;
 
-              UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(50, 22, width - 66, 15)];
-              sub.font = [UIFont systemFontOfSize:12];
-              sub.textColor = UIColor.lightGrayColor;
+              UILabel *sub = [UILabel new];
+              sub.font = [UIFont systemFontOfSize:12.5];
+              sub.textColor = [UIColor colorWithWhite:0.65 alpha:1];
+              sub.alpha = 0;
               [pill addSubview:sub];
               self.subLabel = sub;
 
-              UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(hide)];
+              UILabel *tm = [UILabel new];
+              tm.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
+              tm.textColor = [UIColor colorWithRed:1 green:0.23 blue:0.19 alpha:1];
+              tm.textAlignment = NSTextAlignmentRight;
+              tm.text = @"0:00";
+              tm.alpha = 0;
+              [pill addSubview:tm];
+              self.timerLabel = tm;
+
+              UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped)];
               [pill addGestureRecognizer:tap];
+
+              [self apply:DIModeIdle];
 
               // Battery / charging
               UIDevice.currentDevice.batteryMonitoringEnabled = YES;
@@ -159,8 +209,56 @@ jobs:
                                                                queue:NSOperationQueue.mainQueue
                                                           usingBlock:^(NSNotification *n) { [self batteryChanged]; }];
 
+              // Screen recording
+              [NSNotificationCenter.defaultCenter addObserverForName:UIScreenCapturedDidChangeNotification
+                                                              object:nil
+                                                               queue:NSOperationQueue.mainQueue
+                                                          usingBlock:^(NSNotification *n) { [self captureChanged]; }];
+              [self captureChanged];
+
               [self setupMedia];
-              [self showIcon:@"✅" title:@"DynIsland" sub:@"Твик загружен"];
+          }
+
+          // Lay out + animate the pill into the given mode
+          - (void)apply:(DIMode)m {
+              self.mode = m;
+              CGRect f = [self frameForMode:m];
+              CGFloat w = f.size.width, h = f.size.height;
+              BOOL ex = (m == DIModeExpanded);
+              BOOL cp = (m == DIModeCompact);
+              [UIView animateWithDuration:0.6 delay:0 usingSpringWithDamping:0.72 initialSpringVelocity:0.7
+                                  options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                               animations:^{
+                  self.pill.frame = f;
+                  self.pill.layer.cornerRadius = h / 2;
+                  self.iconLabel.frame  = CGRectMake(20, (h - 30) / 2, 30, 30);
+                  self.titleLabel.frame = CGRectMake(62, 13, w - 82, 20);
+                  self.subLabel.frame   = CGRectMake(62, 34, w - 82, 18);
+                  self.dot.frame        = CGRectMake(20, (h - 10) / 2, 10, 10);
+                  self.timerLabel.frame = CGRectMake(w - 20 - 70, 0, 70, h);
+                  self.iconLabel.alpha  = ex ? 1 : 0;
+                  self.titleLabel.alpha = ex ? 1 : 0;
+                  self.subLabel.alpha   = ex ? 1 : 0;
+                  self.dot.alpha        = cp ? 1 : 0;
+                  self.timerLabel.alpha = cp ? 1 : 0;
+              } completion:nil];
+          }
+
+          // Return to the resting state (idle, or recording pill)
+          - (void)settle {
+              [self apply:self.recording ? DIModeCompact : DIModeIdle];
+          }
+
+          - (void)tapped {
+              if (self.mode == DIModeExpanded) {
+                  self.token++;
+                  [self settle];
+              } else {
+                  int pct = (int)roundf(UIDevice.currentDevice.batteryLevel * 100);
+                  BOOL ch = (UIDevice.currentDevice.batteryState == UIDeviceBatteryStateCharging);
+                  [self showIcon:(ch ? @"⚡️" : @"🔋") title:@"Батарея"
+                             sub:[NSString stringWithFormat:@"%d%%", pct < 0 ? 0 : pct]];
+              }
           }
 
           - (void)batteryChanged {
@@ -168,11 +266,40 @@ jobs:
               if (s == self.lastState) return;
               self.lastState = s;
               int pct = (int)roundf(UIDevice.currentDevice.batteryLevel * 100);
-              NSString *sub = [NSString stringWithFormat:@"%d%%", pct];
+              NSString *sub = [NSString stringWithFormat:@"%d%%", pct < 0 ? 0 : pct];
               if (s == UIDeviceBatteryStateCharging || s == UIDeviceBatteryStateFull) {
                   [self showIcon:@"⚡️" title:@"Зарядка" sub:sub];
               } else if (s == UIDeviceBatteryStateUnplugged) {
                   [self showIcon:@"🔋" title:@"Отключено" sub:sub];
+              }
+          }
+
+          - (NSString *)elapsedString {
+              NSInteger sec = self.recStart ? (NSInteger)[[NSDate date] timeIntervalSinceDate:self.recStart] : 0;
+              if (sec >= 3600) return [NSString stringWithFormat:@"%ld:%02ld:%02ld", (long)(sec / 3600), (long)((sec / 60) % 60), (long)(sec % 60)];
+              return [NSString stringWithFormat:@"%ld:%02ld", (long)(sec / 60), (long)(sec % 60)];
+          }
+
+          - (void)captureChanged {
+              BOOL c = UIScreen.mainScreen.isCaptured;
+              if (c == self.recording) return;
+              self.recording = c;
+              if (c) {
+                  self.recStart = [NSDate date];
+                  self.timerLabel.text = @"0:00";
+                  [self.recTimer invalidate];
+                  NSTimer *t = [NSTimer timerWithTimeInterval:1 repeats:YES block:^(NSTimer *tm) {
+                      self.timerLabel.text = [self elapsedString];
+                  }];
+                  [NSRunLoop.mainRunLoop addTimer:t forMode:NSRunLoopCommonModes];
+                  self.recTimer = t;
+                  [self showIcon:@"🔴" title:@"Запись экрана" sub:@"Идёт запись"];
+              } else {
+                  [self.recTimer invalidate];
+                  self.recTimer = nil;
+                  NSString *d = [self elapsedString];
+                  self.recStart = nil;
+                  [self showIcon:@"⏹" title:@"Запись остановлена" sub:d];
               }
           }
 
@@ -206,24 +333,11 @@ jobs:
               self.iconLabel.text = icon;
               self.titleLabel.text = title;
               self.subLabel.text = sub;
+              [self apply:DIModeExpanded];
               NSInteger t = ++self.token;
-              [UIView animateWithDuration:0.55 delay:0 usingSpringWithDamping:0.65 initialSpringVelocity:0.8
-                                  options:UIViewAnimationOptionBeginFromCurrentState
-                               animations:^{
-                  self.pill.alpha = 1;
-                  self.pill.transform = CGAffineTransformIdentity;
-              } completion:nil];
               dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-                  if (self.token == t) [self hide];
+                  if (self.token == t) [self settle];
               });
-          }
-
-          - (void)hide {
-              [UIView animateWithDuration:0.35 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
-                               animations:^{
-                  self.pill.alpha = 0;
-                  self.pill.transform = CGAffineTransformMakeScale(0.4, 0.6);
-              } completion:nil];
           }
 
           @end
