@@ -6,12 +6,13 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     steps:
       - name: Install Theos
         run: |
           brew install ldid dpkg make
           git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          rm -rf "$HOME/theos/sdks"
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
       - name: Write project files
@@ -20,7 +21,7 @@ jobs:
           cd DynIsland
 
           cat > Makefile <<'EOF'
-          TARGET := iphone:clang:latest:14.0
+          TARGET := iphone:clang:latest:15.0
           ARCHS = arm64 arm64e
           THEOS_PACKAGE_SCHEME = rootless
           INSTALL_TARGET_PROCESSES = SpringBoard
@@ -39,7 +40,6 @@ jobs:
           Package: com.local.dynisland
           Name: DynIsland
           Version: 0.1.0
-          Architecture: iphoneos-arm
           Description: Dynamic Island style pill for notch iPhones
           Maintainer: me
           Author: me
@@ -243,7 +243,7 @@ jobs:
           cd DynIsland
           export THEOS="$HOME/theos"
           export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
-          make package FINALPACKAGE=1
+          make clean package FINALPACKAGE=1
 
       - name: Upload deb
         uses: actions/upload-artifact@v4
