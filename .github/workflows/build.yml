@@ -1,0 +1,252 @@
+name: Build DynIsland
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Install Theos
+        run: |
+          brew install ldid dpkg make
+          git clone --recursive https://github.com/theos/theos.git "$HOME/theos"
+          git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
+
+      - name: Write project files
+        run: |
+          mkdir -p DynIsland
+          cd DynIsland
+
+          cat > Makefile <<'EOF'
+          TARGET := iphone:clang:latest:14.0
+          ARCHS = arm64 arm64e
+          THEOS_PACKAGE_SCHEME = rootless
+          INSTALL_TARGET_PROCESSES = SpringBoard
+
+          include $(THEOS)/makefiles/common.mk
+
+          TWEAK_NAME = DynIsland
+          DynIsland_FILES = Tweak.x
+          DynIsland_CFLAGS = -fobjc-arc
+          DynIsland_FRAMEWORKS = UIKit
+
+          include $(THEOS_MAKE_PATH)/tweak.mk
+          EOF
+
+          cat > control <<'EOF'
+          Package: com.local.dynisland
+          Name: DynIsland
+          Version: 0.1.0
+          Architecture: iphoneos-arm
+          Description: Dynamic Island style pill for notch iPhones
+          Maintainer: me
+          Author: me
+          Section: Tweaks
+          Depends: mobilesubstrate
+          EOF
+
+          cat > DynIsland.plist <<'EOF'
+          { Filter = { Bundles = ( "com.apple.springboard" ); }; }
+          EOF
+
+          cat > Tweak.x <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <dlfcn.h>
+
+          @interface SpringBoard : UIApplication
+          @end
+
+          // Window that lets all touches pass through except those on the pill
+          @interface DIWindow : UIWindow
+          @end
+
+          @implementation DIWindow
+          - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+              UIView *v = [super hitTest:point withEvent:event];
+              if (v == self || v == self.rootViewController.view) return nil;
+              return v;
+          }
+          @end
+
+          typedef void (^DIInfoBlock)(CFDictionaryRef info);
+          typedef void (*DIRegisterFn)(dispatch_queue_t queue);
+          typedef void (*DIGetInfoFn)(dispatch_queue_t queue, DIInfoBlock block);
+
+          @interface DIController : NSObject
+          @property (nonatomic, strong) DIWindow *window;
+          @property (nonatomic, strong) UIView *pill;
+          @property (nonatomic, strong) UILabel *iconLabel;
+          @property (nonatomic, strong) UILabel *titleLabel;
+          @property (nonatomic, strong) UILabel *subLabel;
+          @property (nonatomic, copy) NSString *lastTrack;
+          @property (nonatomic, assign) UIDeviceBatteryState lastState;
+          @property (nonatomic, assign) NSInteger token;
+          + (instancetype)shared;
+          - (void)start;
+          @end
+
+          @implementation DIController
+
+          + (instancetype)shared {
+              static DIController *c;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ c = [DIController new]; });
+              return c;
+          }
+
+          - (void)start {
+              if (self.window) return;
+
+              UIWindowScene *scene = nil;
+              for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+                  if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+              }
+              CGRect bounds = UIScreen.mainScreen.bounds;
+              DIWindow *w = scene ? [[DIWindow alloc] initWithWindowScene:scene]
+                                  : [[DIWindow alloc] initWithFrame:bounds];
+              w.frame = bounds;
+              w.windowLevel = UIWindowLevelAlert + 1000;
+              w.backgroundColor = UIColor.clearColor;
+              UIViewController *vc = [UIViewController new];
+              vc.view.backgroundColor = UIColor.clearColor;
+              w.rootViewController = vc;
+              w.hidden = NO;
+              self.window = w;
+
+              CGFloat width = 300, height = 44;
+              CGFloat top = (bounds.size.height >= 812) ? 36 : 12; // just under the notch
+
+              UIView *pill = [[UIView alloc] initWithFrame:CGRectMake((bounds.size.width - width) / 2, top, width, height)];
+              pill.backgroundColor = UIColor.blackColor;
+              pill.layer.cornerRadius = height / 2;
+              pill.layer.shadowColor = UIColor.blackColor.CGColor;
+              pill.layer.shadowOpacity = 0.4;
+              pill.layer.shadowRadius = 8;
+              pill.layer.shadowOffset = CGSizeMake(0, 3);
+              pill.alpha = 0;
+              pill.transform = CGAffineTransformMakeScale(0.4, 0.6);
+              [vc.view addSubview:pill];
+              self.pill = pill;
+
+              UILabel *icon = [[UILabel alloc] initWithFrame:CGRectMake(14, 0, 28, height)];
+              icon.font = [UIFont systemFontOfSize:20];
+              icon.textAlignment = NSTextAlignmentCenter;
+              [pill addSubview:icon];
+              self.iconLabel = icon;
+
+              UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(50, 5, width - 66, 18)];
+              title.font = [UIFont boldSystemFontOfSize:14];
+              title.textColor = UIColor.whiteColor;
+              [pill addSubview:title];
+              self.titleLabel = title;
+
+              UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(50, 22, width - 66, 15)];
+              sub.font = [UIFont systemFontOfSize:12];
+              sub.textColor = UIColor.lightGrayColor;
+              [pill addSubview:sub];
+              self.subLabel = sub;
+
+              UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(hide)];
+              [pill addGestureRecognizer:tap];
+
+              // Battery / charging
+              UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+              self.lastState = UIDevice.currentDevice.batteryState;
+              [NSNotificationCenter.defaultCenter addObserverForName:UIDeviceBatteryStateDidChangeNotification
+                                                              object:nil
+                                                               queue:NSOperationQueue.mainQueue
+                                                          usingBlock:^(NSNotification *n) { [self batteryChanged]; }];
+
+              [self setupMedia];
+              [self showIcon:@"✅" title:@"DynIsland" sub:@"Твик загружен"];
+          }
+
+          - (void)batteryChanged {
+              UIDeviceBatteryState s = UIDevice.currentDevice.batteryState;
+              if (s == self.lastState) return;
+              self.lastState = s;
+              int pct = (int)roundf(UIDevice.currentDevice.batteryLevel * 100);
+              NSString *sub = [NSString stringWithFormat:@"%d%%", pct];
+              if (s == UIDeviceBatteryStateCharging || s == UIDeviceBatteryStateFull) {
+                  [self showIcon:@"⚡️" title:@"Зарядка" sub:sub];
+              } else if (s == UIDeviceBatteryStateUnplugged) {
+                  [self showIcon:@"🔋" title:@"Отключено" sub:sub];
+              }
+          }
+
+          - (void)setupMedia {
+              void *h = dlopen("/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote", RTLD_NOW);
+              if (!h) return;
+              DIRegisterFn reg = (DIRegisterFn)dlsym(h, "MRMediaRemoteRegisterForNowPlayingNotifications");
+              DIGetInfoFn get = (DIGetInfoFn)dlsym(h, "MRMediaRemoteGetNowPlayingInfo");
+              if (!reg || !get) return;
+              reg(dispatch_get_main_queue());
+              [NSNotificationCenter.defaultCenter addObserverForName:@"kMRMediaRemoteNowPlayingInfoDidChangeNotification"
+                                                              object:nil
+                                                               queue:NSOperationQueue.mainQueue
+                                                          usingBlock:^(NSNotification *n) {
+                  get(dispatch_get_main_queue(), ^(CFDictionaryRef info) {
+                      if (!info) return;
+                      NSDictionary *d = (__bridge NSDictionary *)info;
+                      NSString *title = d[@"kMRMediaRemoteNowPlayingInfoTitle"];
+                      NSString *artist = d[@"kMRMediaRemoteNowPlayingInfoArtist"];
+                      if (![title isKindOfClass:NSString.class] || title.length == 0) return;
+                      if ([title isEqualToString:self.lastTrack]) return;
+                      self.lastTrack = title;
+                      NSString *a = [artist isKindOfClass:NSString.class] ? artist : @"";
+                      [self showIcon:@"🎵" title:title sub:a];
+                  });
+              }];
+          }
+
+          - (void)showIcon:(NSString *)icon title:(NSString *)title sub:(NSString *)sub {
+              if (!self.pill) return;
+              self.iconLabel.text = icon;
+              self.titleLabel.text = title;
+              self.subLabel.text = sub;
+              NSInteger t = ++self.token;
+              [UIView animateWithDuration:0.55 delay:0 usingSpringWithDamping:0.65 initialSpringVelocity:0.8
+                                  options:UIViewAnimationOptionBeginFromCurrentState
+                               animations:^{
+                  self.pill.alpha = 1;
+                  self.pill.transform = CGAffineTransformIdentity;
+              } completion:nil];
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                  if (self.token == t) [self hide];
+              });
+          }
+
+          - (void)hide {
+              [UIView animateWithDuration:0.35 delay:0 options:UIViewAnimationOptionBeginFromCurrentState
+                               animations:^{
+                  self.pill.alpha = 0;
+                  self.pill.transform = CGAffineTransformMakeScale(0.4, 0.6);
+              } completion:nil];
+          }
+
+          @end
+
+          %hook SpringBoard
+          - (void)applicationDidFinishLaunching:(id)application {
+              %orig;
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                  [[DIController shared] start];
+              });
+          }
+          %end
+          EOF
+
+      - name: Build
+        run: |
+          cd DynIsland
+          export THEOS="$HOME/theos"
+          export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+          make package FINALPACKAGE=1
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: DynIsland-deb
+          path: DynIsland/packages/*.deb
