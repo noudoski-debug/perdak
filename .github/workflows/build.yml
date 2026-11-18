@@ -2,6 +2,18 @@ name: Build DynIsland
 
 on:
   workflow_dispatch:
+    inputs:
+      animation:
+        description: "Анимация выхода из приложений (по умолчанию)"
+        type: choice
+        default: island
+        options:
+          - island
+          - swipe
+          - zoom
+          - spin
+          - fade
+          - "off"
   push:
 
 jobs:
@@ -16,15 +28,29 @@ jobs:
           git clone --depth=1 https://github.com/theos/sdks.git "$HOME/theos/sdks"
 
       - name: Write project files
+        env:
+          ANIM: ${{ github.event.inputs.animation || 'island' }}
         run: |
-          mkdir -p DynIsland
+          mkdir -p DynIsland/tweak DynIsland/app/Resources DynIsland/layout/DEBIAN
           cd DynIsland
 
           cat > Makefile <<'EOF'
+          export THEOS_PACKAGE_SCHEME = rootless
+          TARGET := iphone:clang:latest:15.0
+          ARCHS = arm64 arm64e
+          INSTALL_TARGET_PROCESSES = SpringBoard
+
+          include $(THEOS)/makefiles/common.mk
+
+          SUBPROJECTS = tweak app
+
+          include $(THEOS_MAKE_PATH)/aggregate.mk
+          EOF
+
+          cat > tweak/Makefile <<'EOF'
           TARGET := iphone:clang:latest:15.0
           ARCHS = arm64 arm64e
           THEOS_PACKAGE_SCHEME = rootless
-          INSTALL_TARGET_PROCESSES = SpringBoard
 
           include $(THEOS)/makefiles/common.mk
 
@@ -36,42 +62,100 @@ jobs:
           include $(THEOS_MAKE_PATH)/tweak.mk
           EOF
 
+          cat > app/Makefile <<'EOF'
+          TARGET := iphone:clang:latest:15.0
+          ARCHS = arm64 arm64e
+          THEOS_PACKAGE_SCHEME = rootless
+
+          include $(THEOS)/makefiles/common.mk
+
+          APPLICATION_NAME = DynIslandPrefs
+          DynIslandPrefs_FILES = main.m
+          DynIslandPrefs_CFLAGS = -fobjc-arc
+          DynIslandPrefs_FRAMEWORKS = UIKit
+          DynIslandPrefs_CODESIGN_FLAGS = -Sentitlements.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          EOF
+
           cat > control <<'EOF'
           Package: com.local.dynisland
           Name: DynIsland
-          Version: 0.2.0
-          Description: Always-on Dynamic Island style pill for notch iPhones
+          Version: 0.3.0
+          Description: Always-on Liquid Glass island for notch iPhones, with a settings app
           Maintainer: me
           Author: me
           Section: Tweaks
           Depends: mobilesubstrate
           EOF
 
-          cat > DynIsland.plist <<'EOF'
+          cat > tweak/DynIsland.plist <<'EOF'
           { Filter = { Bundles = ( "com.apple.springboard" ); }; }
           EOF
 
-          cat > Tweak.x <<'EOF'
+          cat > tweak/Tweak.x <<'EOF'
           #import <UIKit/UIKit.h>
           #import <dlfcn.h>
+          #import <notify.h>
+          #import <objc/message.h>
 
-          // Distance from the top of the screen to the island (tweak to taste)
-          #define DI_TOP_NOTCH 22.0
-          #define DI_TOP_FLAT  8.0
+          // Default exit animation, substituted at build time (used until changed in the app)
+          #define DI_DEFAULT_ANIM @"__DEFAULT_ANIM__"
+          #define DI_PREFS_PATH   @"/var/mobile/Library/Preferences/com.local.dynisland.plist"
+          // Distance from the top edge to the island (points); app adds its own offset on top
+          #define DI_TOP_NOTCH 16.0
+          #define DI_TOP_FLAT  6.0
+
+          static NSDictionary *gPrefs;
+          static void DIReload(void) { gPrefs = [NSDictionary dictionaryWithContentsOfFile:DI_PREFS_PATH] ?: @{}; }
+          static NSString *DIStr(NSString *k, NSString *d) { id v = gPrefs[k]; return [v isKindOfClass:NSString.class] ? v : d; }
+          static BOOL DIBool(NSString *k, BOOL d) { id v = gPrefs[k]; return [v isKindOfClass:NSNumber.class] ? [v boolValue] : d; }
+          static CGFloat DIFloat(NSString *k, CGFloat d) { id v = gPrefs[k]; return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : d; }
 
           @interface SpringBoard : UIApplication
+          - (id)_accessibilityFrontMostApplication;
           @end
 
-          // Window that lets all touches pass through except those on the pill
+          // Window that lets all touches through except those on the pill
           @interface DIWindow : UIWindow
+          @property (nonatomic, weak) UIView *interactiveView;
           @end
 
           @implementation DIWindow
           - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
               UIView *v = [super hitTest:point withEvent:event];
-              if (v == self || v == self.rootViewController.view) return nil;
-              return v;
+              if (v && self.interactiveView && [v isDescendantOfView:self.interactiveView]) return v;
+              return nil;
           }
+          @end
+
+          // Root controller: reports rotation so the island can stay put physically
+          @interface DIRootVC : UIViewController
+          @property (nonatomic, copy) void (^relayout)(id<UIViewControllerTransitionCoordinator> c);
+          @property (nonatomic, assign) BOOL inTransition;
+          @end
+
+          @implementation DIRootVC
+          - (void)viewDidLayoutSubviews {
+              [super viewDidLayoutSubviews];
+              if (!self.inTransition && self.relayout) self.relayout(nil);
+          }
+          - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)c {
+              [super viewWillTransitionToSize:size withTransitionCoordinator:c];
+              self.inTransition = YES;
+              if (self.relayout) self.relayout(c);
+              [c animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> ctx) {
+                  self.inTransition = NO;
+              }];
+          }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAll; }
+          @end
+
+          @interface DIGradientView : UIView
+          @end
+          @implementation DIGradientView
+          + (Class)layerClass { return [CAGradientLayer class]; }
           @end
 
           typedef void (^DIInfoBlock)(CFDictionaryRef info);
@@ -86,7 +170,12 @@ jobs:
 
           @interface DIController : NSObject
           @property (nonatomic, strong) DIWindow *window;
+          @property (nonatomic, strong) UIView *host;
           @property (nonatomic, strong) UIView *pill;
+          @property (nonatomic, strong) UIView *clip;
+          @property (nonatomic, strong) UIVisualEffectView *blur;
+          @property (nonatomic, strong) UIView *tint;
+          @property (nonatomic, strong) DIGradientView *spec;
           @property (nonatomic, strong) UIView *dot;
           @property (nonatomic, strong) UILabel *iconLabel;
           @property (nonatomic, strong) UILabel *titleLabel;
@@ -100,9 +189,14 @@ jobs:
           @property (nonatomic, strong) NSDate *recStart;
           @property (nonatomic, strong) NSTimer *recTimer;
           @property (nonatomic, assign) CGFloat top;
+          @property (nonatomic, assign) BOOL hadApp;
+          @property (nonatomic, strong) NSTimer *watchTimer;
+          @property (nonatomic, strong) UIView *exitView;
           + (instancetype)shared;
           - (void)start;
           @end
+
+          static int gPrefsToken, gPreviewToken;
 
           @implementation DIController
 
@@ -113,8 +207,17 @@ jobs:
               return c;
           }
 
+          // Portrait-fixed screen size (independent of current interface orientation)
+          - (CGRect)fixedBounds {
+              return UIScreen.mainScreen.fixedCoordinateSpace.bounds;
+          }
+
+          - (CGFloat)baseTop {
+              return ([self fixedBounds].size.height >= 812) ? DI_TOP_NOTCH : DI_TOP_FLAT;
+          }
+
           - (CGRect)frameForMode:(DIMode)m {
-              CGFloat W = UIScreen.mainScreen.bounds.size.width;
+              CGFloat W = [self fixedBounds].size.width;
               CGSize s;
               switch (m) {
                   case DIModeIdle:     s = CGSizeMake(126, 37); break;
@@ -124,8 +227,36 @@ jobs:
               return CGRectMake((W - s.width) / 2, self.top, s.width, s.height);
           }
 
+          // Keep the host view glued to the physical (portrait) screen, whatever the UI orientation
+          - (void)updateHost:(id<UIViewControllerTransitionCoordinator>)c {
+              UIView *root = self.window.rootViewController.view;
+              if (!root || !self.host) return;
+              CGRect fb = [self fixedBounds];
+              self.host.bounds = CGRectMake(0, 0, fb.size.width, fb.size.height);
+              self.host.center = CGPointMake(CGRectGetMidX(root.bounds), CGRectGetMidY(root.bounds));
+              if (c) {
+                  [c animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> ctx) {
+                      self.host.transform = CGAffineTransformConcat(self.host.transform,
+                                                                    CGAffineTransformInvert(ctx.targetTransform));
+                  } completion:^(id<UIViewControllerTransitionCoordinatorContext> ctx) {
+                      [self syncHostRotation];
+                  }];
+              } else {
+                  [self syncHostRotation];
+              }
+          }
+
+          - (void)syncHostRotation {
+              id<UICoordinateSpace> fs = UIScreen.mainScreen.fixedCoordinateSpace;
+              CGPoint p0 = [self.window convertPoint:CGPointZero toCoordinateSpace:fs];
+              CGPoint p1 = [self.window convertPoint:CGPointMake(1, 0) toCoordinateSpace:fs];
+              CGFloat theta = atan2(p1.y - p0.y, p1.x - p0.x);
+              self.host.transform = CGAffineTransformMakeRotation(-theta);
+          }
+
           - (void)start {
               if (self.window) return;
+              DIReload();
 
               UIWindowScene *scene = nil;
               for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
@@ -137,21 +268,65 @@ jobs:
               w.frame = bounds;
               w.windowLevel = UIWindowLevelAlert + 1000;
               w.backgroundColor = UIColor.clearColor;
-              UIViewController *vc = [UIViewController new];
+
+              DIRootVC *vc = [DIRootVC new];
               vc.view.backgroundColor = UIColor.clearColor;
+              __weak typeof(self) ws = self;
+              vc.relayout = ^(id<UIViewControllerTransitionCoordinator> c) { [ws updateHost:c]; };
               w.rootViewController = vc;
               w.hidden = NO;
               self.window = w;
 
-              self.top = (bounds.size.height >= 812) ? DI_TOP_NOTCH : DI_TOP_FLAT;
+              UIView *host = [UIView new];
+              host.backgroundColor = UIColor.clearColor;
+              [vc.view addSubview:host];
+              self.host = host;
+              [self updateHost:nil];
+
+              self.top = [self baseTop] + DIFloat(@"yOffset", 0);
 
               CGRect f = [self frameForMode:DIModeIdle];
               UIView *pill = [[UIView alloc] initWithFrame:f];
-              pill.backgroundColor = UIColor.blackColor;
-              pill.layer.cornerRadius = f.size.height / 2;
-              if (@available(iOS 13.0, *)) pill.layer.cornerCurve = kCACornerCurveContinuous;
-              [vc.view addSubview:pill];
+              pill.backgroundColor = UIColor.clearColor;
+              [host addSubview:pill];
               self.pill = pill;
+              w.interactiveView = pill;
+
+              // Glass / solid body (clipped, follows pill frame through autoresizing)
+              UIView *clip = [[UIView alloc] initWithFrame:pill.bounds];
+              clip.clipsToBounds = YES;
+              clip.layer.cornerRadius = f.size.height / 2;
+              if (@available(iOS 13.0, *)) clip.layer.cornerCurve = kCACornerCurveContinuous;
+              clip.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [pill addSubview:clip];
+              self.clip = clip;
+
+              UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
+                  [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+              blur.frame = clip.bounds;
+              blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [clip addSubview:blur];
+              self.blur = blur;
+
+              UIView *tint = [[UIView alloc] initWithFrame:clip.bounds];
+              tint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [clip addSubview:tint];
+              self.tint = tint;
+
+              // Specular highlight: bright top edge, soft rim at the bottom
+              DIGradientView *spec = [[DIGradientView alloc] initWithFrame:clip.bounds];
+              spec.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              spec.userInteractionEnabled = NO;
+              CAGradientLayer *gl = (CAGradientLayer *)spec.layer;
+              gl.colors = @[(id)[UIColor colorWithWhite:1 alpha:0.42].CGColor,
+                            (id)[UIColor colorWithWhite:1 alpha:0.10].CGColor,
+                            (id)[UIColor colorWithWhite:1 alpha:0.0].CGColor,
+                            (id)[UIColor colorWithWhite:1 alpha:0.14].CGColor];
+              gl.locations = @[@0, @0.32, @0.7, @1];
+              gl.startPoint = CGPointMake(0.25, 0);
+              gl.endPoint = CGPointMake(0.75, 1);
+              [clip addSubview:spec];
+              self.spec = spec;
 
               UIView *dot = [UIView new];
               dot.backgroundColor = [UIColor colorWithRed:1 green:0.23 blue:0.19 alpha:1];
@@ -182,7 +357,7 @@ jobs:
 
               UILabel *sub = [UILabel new];
               sub.font = [UIFont systemFontOfSize:12.5];
-              sub.textColor = [UIColor colorWithWhite:0.65 alpha:1];
+              sub.textColor = [UIColor colorWithWhite:0.75 alpha:1];
               sub.alpha = 0;
               [pill addSubview:sub];
               self.subLabel = sub;
@@ -199,6 +374,7 @@ jobs:
               UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped)];
               [pill addGestureRecognizer:tap];
 
+              [self applyStyle];
               [self apply:DIModeIdle];
 
               // Battery / charging
@@ -217,6 +393,38 @@ jobs:
               [self captureChanged];
 
               [self setupMedia];
+              [self startWatch];
+
+              // Live settings from the DynIsland app
+              notify_register_dispatch("com.local.dynisland/prefs", &gPrefsToken, dispatch_get_main_queue(), ^(int t) {
+                  [self reloadPrefs];
+              });
+              notify_register_dispatch("com.local.dynisland/preview", &gPreviewToken, dispatch_get_main_queue(), ^(int t) {
+                  [self playExit];
+              });
+          }
+
+          - (void)reloadPrefs {
+              DIReload();
+              self.top = [self baseTop] + DIFloat(@"yOffset", 0);
+              [self applyStyle];
+              [self captureChanged];
+              [self apply:self.mode];
+          }
+
+          // Liquid Glass (blur + highlights + rim) or classic solid black
+          - (void)applyStyle {
+              BOOL glass = [DIStr(@"style", @"glass") isEqualToString:@"glass"];
+              CGFloat b = MAX(0, MIN(1, DIFloat(@"glassBrightness", 0.15)));
+              self.blur.hidden = !glass;
+              self.spec.hidden = !glass;
+              self.tint.backgroundColor = glass ? [UIColor colorWithWhite:b alpha:0.34] : UIColor.blackColor;
+              self.clip.layer.borderWidth = glass ? 0.8 : 0;
+              self.clip.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
+              self.pill.layer.shadowColor = UIColor.blackColor.CGColor;
+              self.pill.layer.shadowOpacity = glass ? 0.35 : 0;
+              self.pill.layer.shadowRadius = 14;
+              self.pill.layer.shadowOffset = CGSizeMake(0, 6);
           }
 
           // Lay out + animate the pill into the given mode
@@ -230,7 +438,7 @@ jobs:
                                   options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
                                animations:^{
                   self.pill.frame = f;
-                  self.pill.layer.cornerRadius = h / 2;
+                  self.clip.layer.cornerRadius = h / 2;
                   self.iconLabel.frame  = CGRectMake(20, (h - 30) / 2, 30, 30);
                   self.titleLabel.frame = CGRectMake(62, 13, w - 82, 20);
                   self.subLabel.frame   = CGRectMake(62, 34, w - 82, 18);
@@ -265,6 +473,7 @@ jobs:
               UIDeviceBatteryState s = UIDevice.currentDevice.batteryState;
               if (s == self.lastState) return;
               self.lastState = s;
+              if (!DIBool(@"showBattery", YES)) return;
               int pct = (int)roundf(UIDevice.currentDevice.batteryLevel * 100);
               NSString *sub = [NSString stringWithFormat:@"%d%%", pct < 0 ? 0 : pct];
               if (s == UIDeviceBatteryStateCharging || s == UIDeviceBatteryStateFull) {
@@ -281,7 +490,7 @@ jobs:
           }
 
           - (void)captureChanged {
-              BOOL c = UIScreen.mainScreen.isCaptured;
+              BOOL c = UIScreen.mainScreen.isCaptured && DIBool(@"showRecording", YES);
               if (c == self.recording) return;
               self.recording = c;
               if (c) {
@@ -299,8 +508,90 @@ jobs:
                   self.recTimer = nil;
                   NSString *d = [self elapsedString];
                   self.recStart = nil;
+                  if (UIScreen.mainScreen.isCaptured) { [self settle]; return; } // just switched off in settings
                   [self showIcon:@"⏹" title:@"Запись остановлена" sub:d];
               }
+          }
+
+          // Watch for "an app was frontmost, now home" and play the exit effect
+          - (void)startWatch {
+              SpringBoard *sb = (SpringBoard *)UIApplication.sharedApplication;
+              if (![sb respondsToSelector:@selector(_accessibilityFrontMostApplication)]) return;
+              NSTimer *t = [NSTimer timerWithTimeInterval:0.04 repeats:YES block:^(NSTimer *x) {
+                  BOOL has = ([sb _accessibilityFrontMostApplication] != nil);
+                  if (self.hadApp && !has && ![self deviceLocked]) [self playExit];
+                  self.hadApp = has;
+              }];
+              [NSRunLoop.mainRunLoop addTimer:t forMode:NSRunLoopCommonModes];
+              self.watchTimer = t;
+          }
+
+          - (BOOL)deviceLocked {
+              Class LM = NSClassFromString(@"SBLockScreenManager");
+              SEL shared = NSSelectorFromString(@"sharedInstance");
+              SEL locked = NSSelectorFromString(@"isUILocked");
+              if (!LM || ![LM respondsToSelector:shared]) return NO;
+              id mgr = ((id (*)(id, SEL))objc_msgSend)(LM, shared);
+              if (!mgr || ![mgr respondsToSelector:locked]) return NO;
+              return ((BOOL (*)(id, SEL))objc_msgSend)(mgr, locked);
+          }
+
+          - (void)playExit {
+              NSString *a = DIStr(@"exitAnim", DI_DEFAULT_ANIM);
+              if (!self.window || [a isEqualToString:@"off"]) return;
+
+              [self.exitView removeFromSuperview];
+              CGRect b = self.host.bounds;
+              CGRect pf = [self frameForMode:DIModeIdle];
+
+              UIView *v = [[UIView alloc] initWithFrame:b];
+              v.backgroundColor = UIColor.blackColor;
+              v.layer.cornerRadius = 44;
+              if (@available(iOS 13.0, *)) v.layer.cornerCurve = kCACornerCurveContinuous;
+              v.clipsToBounds = YES;
+              v.alpha = 0;
+              v.userInteractionEnabled = NO;
+              [self.host insertSubview:v belowSubview:self.pill];
+              self.exitView = v;
+
+              void (^done)(BOOL) = ^(BOOL f) {
+                  [v removeFromSuperview];
+                  if (self.exitView == v) self.exitView = nil;
+              };
+
+              // quick fade-in so the "app" rect takes over from the system animation
+              [UIView animateWithDuration:0.08 animations:^{ v.alpha = 1; } completion:^(BOOL f) {
+                  if ([a isEqualToString:@"swipe"]) {
+                      [UIView animateWithDuration:0.38 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+                          v.frame = CGRectOffset(b, 0, -b.size.height - 40);
+                      } completion:done];
+                  } else if ([a isEqualToString:@"zoom"]) {
+                      [UIView animateWithDuration:0.42 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+                          v.transform = CGAffineTransformMakeScale(0.08, 0.08);
+                          v.alpha = 0;
+                      } completion:done];
+                  } else if ([a isEqualToString:@"spin"]) {
+                      [UIView animateWithDuration:0.5 delay:0 options:UIViewAnimationOptionCurveEaseIn animations:^{
+                          v.transform = CGAffineTransformScale(CGAffineTransformMakeRotation(M_PI), 0.05, 0.05);
+                          v.alpha = 0;
+                      } completion:done];
+                  } else if ([a isEqualToString:@"fade"]) {
+                      [UIView animateWithDuration:0.4 delay:0.05 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                          v.alpha = 0;
+                      } completion:done];
+                  } else { // island: the app collapses into the pill
+                      [UIView animateWithDuration:0.5 delay:0 usingSpringWithDamping:0.85 initialSpringVelocity:0.4 options:0 animations:^{
+                          v.frame = pf;
+                          v.layer.cornerRadius = pf.size.height / 2;
+                      } completion:^(BOOL f2) {
+                          [UIView animateWithDuration:0.12 animations:^{ v.alpha = 0; } completion:done];
+                          self.pill.transform = CGAffineTransformMakeScale(1.18, 1.18);
+                          [UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.5 initialSpringVelocity:0.8 options:0 animations:^{
+                              self.pill.transform = CGAffineTransformIdentity;
+                          } completion:nil];
+                      }];
+                  }
+              }];
           }
 
           - (void)setupMedia {
@@ -314,6 +605,7 @@ jobs:
                                                               object:nil
                                                                queue:NSOperationQueue.mainQueue
                                                           usingBlock:^(NSNotification *n) {
+                  if (!DIBool(@"showMusic", YES)) return;
                   get(dispatch_get_main_queue(), ^(CFDictionaryRef info) {
                       if (!info) return;
                       NSDictionary *d = (__bridge NSDictionary *)info;
@@ -335,7 +627,8 @@ jobs:
               self.subLabel.text = sub;
               [self apply:DIModeExpanded];
               NSInteger t = ++self.token;
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+              double secs = MAX(1.0, DIFloat(@"showDuration", 3.0));
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(secs * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                   if (self.token == t) [self settle];
               });
           }
@@ -351,6 +644,347 @@ jobs:
           }
           %end
           EOF
+
+          cat > app/main.m <<'EOF'
+          #import <UIKit/UIKit.h>
+          #import <notify.h>
+          #import <spawn.h>
+          #import <unistd.h>
+
+          #define DEFAULT_ANIM @"__DEFAULT_ANIM__"
+          #define PREFS_PATH   @"/var/mobile/Library/Preferences/com.local.dynisland.plist"
+
+          extern char **environ;
+
+          static NSMutableDictionary *gP;
+          static void PLoad(void) { gP = [NSMutableDictionary dictionaryWithContentsOfFile:PREFS_PATH] ?: [NSMutableDictionary dictionary]; }
+          static void PSave(void) {
+              [gP writeToFile:PREFS_PATH atomically:YES];
+              notify_post("com.local.dynisland/prefs");
+          }
+          static NSString *PS(NSString *k, NSString *d) { id v = gP[k]; return [v isKindOfClass:NSString.class] ? v : d; }
+          static BOOL PB(NSString *k, BOOL d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v boolValue] : d; }
+          static double PF(NSString *k, double d) { id v = gP[k]; return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : d; }
+
+          static void Respring(void) {
+              const char *paths[] = { "/var/jb/usr/bin/killall", "/usr/bin/killall" };
+              for (int i = 0; i < 2; i++) {
+                  if (access(paths[i], X_OK) == 0) {
+                      pid_t pid;
+                      char *argv[] = { "killall", "-9", "SpringBoard", NULL };
+                      posix_spawn(&pid, paths[i], NULL, NULL, argv, environ);
+                      return;
+                  }
+              }
+          }
+
+          @interface SettingsVC : UITableViewController
+          @property (nonatomic, strong) NSMutableDictionary *valueLabels;
+          @end
+
+          @implementation SettingsVC
+
+          - (instancetype)init {
+              self = [super initWithStyle:UITableViewStyleInsetGrouped];
+              if (self) { self.title = @"DynIsland"; self.valueLabels = [NSMutableDictionary dictionary]; }
+              return self;
+          }
+
+          - (NSArray *)anims {
+              return @[
+                  @[@"🏝 Остров (схлопывание)", @"island"],
+                  @[@"⬆️ Свайп вверх", @"swipe"],
+                  @[@"🔍 Зум", @"zoom"],
+                  @[@"🌀 Вращение", @"spin"],
+                  @[@"🌫 Затухание", @"fade"],
+                  @[@"🚫 Выключить", @"off"],
+              ];
+          }
+
+          - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 4; }
+
+          - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+              switch (s) { case 0: return 3; case 1: return 7; case 2: return 4; default: return 1; }
+          }
+
+          - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
+              switch (s) {
+                  case 0: return @"Внешний вид";
+                  case 1: return @"Анимация выхода из приложений";
+                  case 2: return @"События";
+                  default: return @"Система";
+              }
+          }
+
+          - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+              if (s == 0) return @"Liquid Glass — размытие, блики и светлая кромка. Изменения применяются сразу.";
+              if (s == 3) return @"Респринг нужен только после установки или обновления твика.";
+              return nil;
+          }
+
+          - (NSString *)format:(double)v tag:(int)tag {
+              if (tag == 1) return [NSString stringWithFormat:@"%d%%", (int)round(v * 100)];
+              if (tag == 2) return [NSString stringWithFormat:@"%+.0f pt", v];
+              return [NSString stringWithFormat:@"%.1f с", v];
+          }
+
+          - (UITableViewCell *)plainCell {
+              UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+              c.selectionStyle = UITableViewCellSelectionStyleNone;
+              return c;
+          }
+
+          - (UITableViewCell *)sliderCell:(NSString *)title min:(float)mn max:(float)mx value:(double)val tag:(int)tag enabled:(BOOL)en {
+              UITableViewCell *c = [self plainCell];
+              UILabel *t = [UILabel new];
+              t.text = title;
+              [t setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+              UILabel *vl = [UILabel new];
+              vl.textColor = UIColor.secondaryLabelColor;
+              vl.text = [self format:val tag:tag];
+              self.valueLabels[@(tag)] = vl;
+              UIStackView *top = [[UIStackView alloc] initWithArrangedSubviews:@[t, vl]];
+              UISlider *s = [UISlider new];
+              s.minimumValue = mn; s.maximumValue = mx; s.value = (float)val;
+              s.tag = tag; s.enabled = en;
+              [s addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+              UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[top, s]];
+              col.axis = UILayoutConstraintAxisVertical;
+              col.spacing = 8;
+              col.translatesAutoresizingMaskIntoConstraints = NO;
+              [c.contentView addSubview:col];
+              UILayoutGuide *g = c.contentView.layoutMarginsGuide;
+              [NSLayoutConstraint activateConstraints:@[
+                  [col.topAnchor constraintEqualToAnchor:g.topAnchor constant:4],
+                  [col.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-4],
+                  [col.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+                  [col.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+              ]];
+              return c;
+          }
+
+          - (UITableViewCell *)switchCell:(NSString *)title on:(BOOL)on tag:(int)tag {
+              UITableViewCell *c = [self plainCell];
+              c.textLabel.text = title;
+              UISwitch *sw = [UISwitch new];
+              sw.on = on; sw.tag = tag;
+              [sw addTarget:self action:@selector(switchChanged:) forControlEvents:UIControlEventValueChanged];
+              c.accessoryView = sw;
+              return c;
+          }
+
+          - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+              BOOL glass = [PS(@"style", @"glass") isEqualToString:@"glass"];
+              if (ip.section == 0) {
+                  if (ip.row == 0) {
+                      UITableViewCell *c = [self plainCell];
+                      UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"Liquid Glass", @"Обычный"]];
+                      seg.selectedSegmentIndex = glass ? 0 : 1;
+                      [seg addTarget:self action:@selector(styleChanged:) forControlEvents:UIControlEventValueChanged];
+                      seg.translatesAutoresizingMaskIntoConstraints = NO;
+                      [c.contentView addSubview:seg];
+                      UILayoutGuide *g = c.contentView.layoutMarginsGuide;
+                      [NSLayoutConstraint activateConstraints:@[
+                          [seg.topAnchor constraintEqualToAnchor:g.topAnchor constant:4],
+                          [seg.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-4],
+                          [seg.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+                          [seg.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+                      ]];
+                      return c;
+                  }
+                  if (ip.row == 1) return [self sliderCell:@"Яркость стекла" min:0 max:1 value:PF(@"glassBrightness", 0.15) tag:1 enabled:glass];
+                  return [self sliderCell:@"Положение (выше ← → ниже)" min:-12 max:24 value:PF(@"yOffset", 0) tag:2 enabled:YES];
+              }
+              if (ip.section == 1) {
+                  UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+                  if (ip.row < 6) {
+                      NSArray *it = [self anims][ip.row];
+                      c.textLabel.text = it[0];
+                      c.accessoryType = [PS(@"exitAnim", DEFAULT_ANIM) isEqualToString:it[1]] ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+                  } else {
+                      c.textLabel.text = @"▶︎ Проверить анимацию";
+                      c.textLabel.textColor = self.view.tintColor;
+                  }
+                  return c;
+              }
+              if (ip.section == 2) {
+                  if (ip.row == 0) return [self switchCell:@"Батарея и зарядка" on:PB(@"showBattery", YES) tag:10];
+                  if (ip.row == 1) return [self switchCell:@"Музыка" on:PB(@"showMusic", YES) tag:11];
+                  if (ip.row == 2) return [self switchCell:@"Запись экрана" on:PB(@"showRecording", YES) tag:12];
+                  return [self sliderCell:@"Время показа" min:1 max:6 value:PF(@"showDuration", 3.0) tag:3 enabled:YES];
+              }
+              UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+              c.textLabel.text = @"Респринг";
+              c.textLabel.textColor = UIColor.systemRedColor;
+              return c;
+          }
+
+          - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+              [tv deselectRowAtIndexPath:ip animated:YES];
+              if (ip.section == 1) {
+                  if (ip.row < 6) {
+                      gP[@"exitAnim"] = [self anims][ip.row][1];
+                      PSave();
+                      [tv reloadSections:[NSIndexSet indexSetWithIndex:1] withRowAnimation:UITableViewRowAnimationNone];
+                  }
+                  // rows 0-5 preview right away, row 6 just replays
+                  if (ip.row != 5) {
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.25 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                          notify_post("com.local.dynisland/preview");
+                      });
+                  }
+              } else if (ip.section == 3) {
+                  Respring();
+              }
+          }
+
+          - (void)styleChanged:(UISegmentedControl *)seg {
+              gP[@"style"] = seg.selectedSegmentIndex == 0 ? @"glass" : @"classic";
+              PSave();
+              [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0] withRowAnimation:UITableViewRowAnimationNone];
+          }
+
+          - (void)sliderChanged:(UISlider *)s {
+              NSString *key = (s.tag == 1) ? @"glassBrightness" : (s.tag == 2) ? @"yOffset" : @"showDuration";
+              double v = s.value;
+              if (s.tag == 2) v = round(v);
+              gP[key] = @(v);
+              ((UILabel *)self.valueLabels[@(s.tag)]).text = [self format:v tag:(int)s.tag];
+              PSave();
+          }
+
+          - (void)switchChanged:(UISwitch *)sw {
+              NSString *key = (sw.tag == 10) ? @"showBattery" : (sw.tag == 11) ? @"showMusic" : @"showRecording";
+              gP[key] = @(sw.on);
+              PSave();
+          }
+
+          @end
+
+          @interface AppDelegate : UIResponder <UIApplicationDelegate>
+          @property (nonatomic, strong) UIWindow *window;
+          @end
+
+          @implementation AppDelegate
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts {
+              PLoad();
+              self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+              UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[SettingsVC new]];
+              nav.navigationBar.prefersLargeTitles = YES;
+              self.window.rootViewController = nav;
+              [self.window makeKeyAndVisible];
+              return YES;
+          }
+          @end
+
+          int main(int argc, char *argv[]) {
+              @autoreleasepool {
+                  return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+              }
+          }
+          EOF
+
+          cat > app/Resources/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>CFBundleDevelopmentRegion</key><string>en</string>
+          	<key>CFBundleExecutable</key><string>DynIslandPrefs</string>
+          	<key>CFBundleIdentifier</key><string>com.local.dynisland.prefs</string>
+          	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+          	<key>CFBundleName</key><string>DynIsland</string>
+          	<key>CFBundleDisplayName</key><string>DynIsland</string>
+          	<key>CFBundlePackageType</key><string>APPL</string>
+          	<key>CFBundleShortVersionString</key><string>0.3.0</string>
+          	<key>CFBundleVersion</key><string>0.3.0</string>
+          	<key>LSRequiresIPhoneOS</key><true/>
+          	<key>MinimumOSVersion</key><string>15.0</string>
+          	<key>UIDeviceFamily</key><array><integer>1</integer></array>
+          	<key>UIRequiredDeviceCapabilities</key><array><string>arm64</string></array>
+          	<key>UILaunchScreen</key><dict/>
+          	<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+          	<key>CFBundleIcons</key>
+          	<dict>
+          		<key>CFBundlePrimaryIcon</key>
+          		<dict>
+          			<key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array>
+          			<key>CFBundleIconName</key><string>AppIcon</string>
+          		</dict>
+          	</dict>
+          </dict>
+          </plist>
+          EOF
+
+          cat > app/entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+          	<key>platform-application</key><true/>
+          	<key>com.apple.private.security.no-container</key><true/>
+          	<key>com.apple.private.security.no-sandbox</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          cat > layout/DEBIAN/postinst <<'EOF'
+          #!/bin/sh
+          # Register the settings app on the home screen
+          if [ -x /var/jb/usr/bin/uicache ]; then
+            /var/jb/usr/bin/uicache -p /var/jb/Applications/DynIslandPrefs.app 2>/dev/null || /var/jb/usr/bin/uicache -a 2>/dev/null
+          elif command -v uicache >/dev/null 2>&1; then
+            uicache -p /Applications/DynIslandPrefs.app 2>/dev/null || uicache -a 2>/dev/null
+          fi
+          exit 0
+          EOF
+
+          chmod 755 layout/DEBIAN/postinst
+
+          cat > icon.py <<'EOF'
+          import zlib, struct, math
+
+          def png(path, n):
+              rows = []
+              for y in range(n):
+                  row = bytearray([0])
+                  for x in range(n):
+                      u, v = x / n, y / n
+                      # blue-violet gradient background
+                      r = 40 + 70 * u * (1 - v) + 20 * v
+                      g = 70 + 100 * (1 - v) * (1 - 0.5 * u)
+                      b = 170 + 70 * (1 - u * 0.6)
+                      # black capsule (the "island")
+                      cx, cy, hw, hh = 0.5, 0.30, 0.27, 0.075
+                      px = max(abs(u - cx) - (hw - hh), 0)
+                      d = math.hypot(px, v - cy) - hh
+                      cov = max(0.0, min(1.0, 0.5 - d * n))
+                      ring = max(0.0, 1.0 - abs(d * n + 0.7) / 1.4) * 0.35 * (1 - v)
+                      r = r * (1 - cov) + 8 * cov
+                      g = g * (1 - cov) + 8 * cov
+                      b = b * (1 - cov) + 10 * cov
+                      r += (255 - r) * ring
+                      g += (255 - g) * ring
+                      b += (255 - b) * ring
+                      row += bytes([int(min(255, r)), int(min(255, g)), int(min(255, b))])
+                  rows.append(bytes(row))
+              raw = b"".join(rows)
+              def chunk(t, d):
+                  c = struct.pack(">I", len(d)) + t + d
+                  return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+              data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 2, 0, 0, 0)) \
+                  + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+              open(path, "wb").write(data)
+
+          png("app/Resources/AppIcon60x60@2x.png", 120)
+          png("app/Resources/AppIcon60x60@3x.png", 180)
+          EOF
+
+          python3 icon.py
+          rm icon.py
+
+          # default exit animation (chosen in the workflow dialog)
+          sed -i '' "s/__DEFAULT_ANIM__/$ANIM/" tweak/Tweak.x app/main.m
 
       - name: Build
         run: |
