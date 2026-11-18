@@ -81,8 +81,8 @@ jobs:
           cat > control <<'EOF'
           Package: com.local.dynisland
           Name: DynIsland
-          Version: 0.3.0
-          Description: Always-on Liquid Glass island for notch iPhones, with a settings app
+          Version: 0.4.0
+          Description: Liquid Glass island, glass icons and home screen tidy-up, with a settings app
           Maintainer: me
           Author: me
           Section: Tweaks
@@ -157,6 +157,46 @@ jobs:
           @implementation DIGradientView
           + (Class)layerClass { return [CAGradientLayer class]; }
           @end
+
+          // ---- Glass highlight on home screen icons -------------------------------------
+          @interface SBIconImageView : UIView
+          @end
+
+          @interface DIIconGlass : DIGradientView
+          - (void)refresh;
+          @end
+
+          @implementation DIIconGlass
+          - (void)layoutSubviews {
+              [super layoutSubviews];
+              CGFloat side = MIN(self.bounds.size.width, self.bounds.size.height);
+              self.layer.cornerRadius = side * 0.2237;
+              if (@available(iOS 13.0, *)) self.layer.cornerCurve = kCACornerCurveContinuous;
+          }
+          - (void)refresh {
+              BOOL on = DIBool(@"iconGlass", YES);
+              self.hidden = !on;
+              self.alpha = MAX(0.1, MIN(1, DIFloat(@"iconGlassStrength", 0.6)));
+              CAGradientLayer *g = (CAGradientLayer *)self.layer;
+              g.colors = @[(id)[UIColor colorWithWhite:1 alpha:0.40].CGColor,
+                           (id)[UIColor colorWithWhite:1 alpha:0.07].CGColor,
+                           (id)[UIColor colorWithWhite:1 alpha:0.0].CGColor,
+                           (id)[UIColor colorWithWhite:1 alpha:0.12].CGColor];
+              g.locations = @[@0, @0.3, @0.65, @1];
+              g.startPoint = CGPointMake(0.2, 0);
+              g.endPoint = CGPointMake(0.8, 1);
+              self.layer.borderWidth = 0.7;
+              self.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
+              self.userInteractionEnabled = NO;
+          }
+          @end
+
+          static NSHashTable *DIOverlays(void) {
+              static NSHashTable *t;
+              static dispatch_once_t once;
+              dispatch_once(&once, ^{ t = [NSHashTable weakObjectsHashTable]; });
+              return t;
+          }
 
           typedef void (^DIInfoBlock)(CFDictionaryRef info);
           typedef void (*DIRegisterFn)(dispatch_queue_t queue);
@@ -410,6 +450,7 @@ jobs:
               [self applyStyle];
               [self captureChanged];
               [self apply:self.mode];
+              for (DIIconGlass *g in DIOverlays().allObjects) [g refresh];
           }
 
           // Liquid Glass (blur + highlights + rim) or classic solid black
@@ -635,6 +676,24 @@ jobs:
 
           @end
 
+          %hook SBIconImageView
+          - (void)layoutSubviews {
+              %orig;
+              UIView *v = (UIView *)self;
+              DIIconGlass *g = (DIIconGlass *)[v viewWithTag:0xD1A1];
+              if (!g) {
+                  if (!gPrefs) DIReload();
+                  g = [[DIIconGlass alloc] initWithFrame:v.bounds];
+                  g.tag = 0xD1A1;
+                  [v addSubview:g];
+                  [DIOverlays() addObject:g];
+                  [g refresh];
+              }
+              g.frame = v.bounds;
+              [v bringSubviewToFront:g];
+          }
+          %end
+
           %hook SpringBoard
           - (void)applicationDidFinishLaunching:(id)application {
               %orig;
@@ -678,6 +737,140 @@ jobs:
               }
           }
 
+          #define ICONSTATE_PATH @"/var/mobile/Library/SpringBoard/IconState.plist"
+          #define ICONSTATE_BAK  @"/var/mobile/Library/SpringBoard/IconState.plist.dynisland.bak"
+          #define FOLDER_NAME    @"Ненужное"
+
+          // Apple apps the user can choose to keep on the home screen
+          static NSArray *AppleApps(void) {
+              return @[
+                  @[@"App Store", @"com.apple.AppStore"],
+                  @[@"Настройки", @"com.apple.Preferences"],
+                  @[@"Фото (галерея)", @"com.apple.mobileslideshow"],
+                  @[@"Телефон", @"com.apple.mobilephone"],
+                  @[@"Сообщения", @"com.apple.MobileSMS"],
+                  @[@"Safari", @"com.apple.mobilesafari"],
+                  @[@"Камера", @"com.apple.camera"],
+                  @[@"Почта", @"com.apple.mobilemail"],
+                  @[@"Карты", @"com.apple.Maps"],
+                  @[@"Часы", @"com.apple.mobiletimer"],
+                  @[@"Календарь", @"com.apple.mobilecal"],
+                  @[@"Заметки", @"com.apple.mobilenotes"],
+                  @[@"Файлы", @"com.apple.DocumentsApp"],
+                  @[@"Музыка", @"com.apple.Music"],
+                  @[@"Wallet", @"com.apple.Passbook"],
+              ];
+          }
+
+          static NSSet *KeepSet(void) {
+              id a = gP[@"keepApps"];
+              if (![a isKindOfClass:NSArray.class])
+                  a = @[@"com.apple.AppStore", @"com.apple.Preferences", @"com.apple.mobileslideshow"];
+              return [NSSet setWithArray:a];
+          }
+
+          // Only real Apple apps; web clips ("com.apple.webapp-...") and kept apps stay
+          static BOOL IsMovable(NSString *bid, NSSet *keep) {
+              return [bid hasPrefix:@"com.apple."] && ![bid hasPrefix:@"com.apple.webapp"] && ![keep containsObject:bid];
+          }
+
+          // Walks a page / folder list, pulls out movable Apple apps, drops emptied folders
+          static NSArray *Process(NSArray *items, NSSet *keep, NSMutableArray *moved) {
+              NSMutableArray *out = [NSMutableArray array];
+              for (id it in items) {
+                  if ([it isKindOfClass:NSString.class]) {
+                      if (IsMovable(it, keep)) { if (![moved containsObject:it]) [moved addObject:it]; }
+                      else [out addObject:it];
+                  } else if ([it isKindOfClass:NSDictionary.class]) {
+                      NSDictionary *d = it;
+                      if ([d[@"listType"] isEqual:@"folder"] && [d[@"iconLists"] isKindOfClass:NSArray.class]) {
+                          BOOL ours = [d[@"displayName"] isEqual:FOLDER_NAME];
+                          NSMutableArray *lists = [NSMutableArray array];
+                          NSMutableArray *flat = [NSMutableArray array];
+                          for (id l in d[@"iconLists"]) {
+                              if (![l isKindOfClass:NSArray.class]) continue;
+                              NSArray *r = Process(l, keep, moved);
+                              if (r.count) { [lists addObject:r]; [flat addObjectsFromArray:r]; }
+                          }
+                          if (ours) {
+                              [out addObjectsFromArray:flat];            // old "Ненужное": rebuilt from scratch
+                          } else if (lists.count) {
+                              NSMutableDictionary *nd = [d mutableCopy];
+                              nd[@"iconLists"] = lists;
+                              [out addObject:nd];
+                          }
+                      } else {
+                          [out addObject:it];                            // widgets etc.
+                      }
+                  } else {
+                      [out addObject:it];
+                  }
+              }
+              return out;
+          }
+
+          // Returns nil on success (and the count), otherwise an error text
+          static NSString *Tidy(NSInteger *count) {
+              NSData *data = [NSData dataWithContentsOfFile:ICONSTATE_PATH];
+              if (!data) return @"Не найден файл раскладки домашнего экрана (IconState.plist).";
+              NSMutableDictionary *st = [NSPropertyListSerialization propertyListWithData:data
+                                                                                  options:NSPropertyListMutableContainers
+                                                                                   format:NULL error:nil];
+              if (![st isKindOfClass:NSDictionary.class] || ![st[@"iconLists"] isKindOfClass:NSArray.class])
+                  return @"Не удалось прочитать раскладку: незнакомый формат.";
+
+              if (![NSFileManager.defaultManager fileExistsAtPath:ICONSTATE_BAK])
+                  [data writeToFile:ICONSTATE_BAK atomically:YES];       // original layout, saved once
+
+              NSSet *keep = KeepSet();
+              NSMutableArray *moved = [NSMutableArray array];
+
+              NSMutableArray *pages = [NSMutableArray array];
+              for (id p in st[@"iconLists"]) {
+                  if (![p isKindOfClass:NSArray.class]) continue;
+                  NSArray *r = Process(p, keep, moved);
+                  if (r.count) [pages addObject:[r mutableCopy]];
+              }
+
+              id dock = st[@"buttonBar"];
+              if ([dock isKindOfClass:NSArray.class]) {
+                  NSMutableArray *nd = [NSMutableArray array];
+                  for (id e in dock) {
+                      if ([e isKindOfClass:NSArray.class]) [nd addObject:Process(e, keep, moved)];
+                      else [nd addObjectsFromArray:Process(@[e], keep, moved)];
+                  }
+                  st[@"buttonBar"] = nd;
+              }
+
+              *count = moved.count;
+              if (moved.count == 0) return @"Лишних Apple-приложений на экране нет.";
+
+              [moved sortUsingSelector:@selector(compare:)];
+              NSMutableArray *lists = [NSMutableArray array];
+              for (NSUInteger i = 0; i < moved.count; i += 9) {
+                  NSUInteger n = MIN(9, moved.count - i);
+                  [lists addObject:[moved subarrayWithRange:NSMakeRange(i, n)]];
+              }
+              NSDictionary *folder = @{ @"displayName": FOLDER_NAME, @"listType": @"folder", @"iconLists": lists };
+
+              NSMutableArray *last = pages.lastObject;
+              if (!last || last.count >= 23) { last = [NSMutableArray array]; [pages addObject:last]; }
+              [last addObject:folder];
+              st[@"iconLists"] = pages;
+
+              NSError *err = nil;
+              NSData *out = [NSPropertyListSerialization dataWithPropertyList:st format:NSPropertyListBinaryFormat_v1_0 options:0 error:&err];
+              if (!out || ![out writeToFile:ICONSTATE_PATH atomically:YES]) return @"Не удалось записать раскладку.";
+              return nil;
+          }
+
+          static NSString *RestoreLayout(void) {
+              NSData *bak = [NSData dataWithContentsOfFile:ICONSTATE_BAK];
+              if (!bak) return @"Резервной копии ещё нет: сначала выполните «Навести порядок».";
+              if (![bak writeToFile:ICONSTATE_PATH atomically:YES]) return @"Не удалось восстановить раскладку.";
+              return nil;
+          }
+
           @interface SettingsVC : UITableViewController
           @property (nonatomic, strong) NSMutableDictionary *valueLabels;
           @end
@@ -701,10 +894,17 @@ jobs:
               ];
           }
 
-          - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 4; }
+          - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 6; }
 
           - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-              switch (s) { case 0: return 3; case 1: return 7; case 2: return 4; default: return 1; }
+              switch (s) {
+                  case 0: return 3;
+                  case 1: return 7;
+                  case 2: return 4;
+                  case 3: return 2;
+                  case 4: return AppleApps().count + 2;
+                  default: return 1;
+              }
           }
 
           - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -712,18 +912,22 @@ jobs:
                   case 0: return @"Внешний вид";
                   case 1: return @"Анимация выхода из приложений";
                   case 2: return @"События";
+                  case 3: return @"Иконки";
+                  case 4: return @"Apple-приложения: что оставить на экране";
                   default: return @"Система";
               }
           }
 
           - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
               if (s == 0) return @"Liquid Glass — размытие, блики и светлая кромка. Изменения применяются сразу.";
-              if (s == 3) return @"Респринг нужен только после установки или обновления твика.";
+              if (s == 3) return @"Прозрачный блик и светлая кромка поверх всех иконок. Это эффект поверх, полной замены иконок он не делает.";
+              if (s == 4) return @"Отмеченное остаётся на экране, остальные Apple-приложения переезжают в папку «Ненужное». Приложения не удаляются, сторонние не трогаются. Старая раскладка сохраняется, её можно вернуть.";
+              if (s == 5) return @"Респринг нужен только после установки или обновления твика.";
               return nil;
           }
 
           - (NSString *)format:(double)v tag:(int)tag {
-              if (tag == 1) return [NSString stringWithFormat:@"%d%%", (int)round(v * 100)];
+              if (tag == 1 || tag == 4) return [NSString stringWithFormat:@"%d%%", (int)round(v * 100)];
               if (tag == 2) return [NSString stringWithFormat:@"%+.0f pt", v];
               return [NSString stringWithFormat:@"%.1f с", v];
           }
@@ -813,6 +1017,21 @@ jobs:
                   if (ip.row == 2) return [self switchCell:@"Запись экрана" on:PB(@"showRecording", YES) tag:12];
                   return [self sliderCell:@"Время показа" min:1 max:6 value:PF(@"showDuration", 3.0) tag:3 enabled:YES];
               }
+              if (ip.section == 3) {
+                  if (ip.row == 0) return [self switchCell:@"Стеклянный блик на иконках" on:PB(@"iconGlass", YES) tag:20];
+                  return [self sliderCell:@"Сила эффекта" min:0.1 max:1 value:PF(@"iconGlassStrength", 0.6) tag:4 enabled:YES];
+              }
+              if (ip.section == 4) {
+                  NSArray *apps = AppleApps();
+                  if (ip.row < apps.count) {
+                      return [self switchCell:apps[ip.row][0] on:[KeepSet() containsObject:apps[ip.row][1]] tag:(int)(100 + ip.row)];
+                  }
+                  UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+                  BOOL tidy = (ip.row == apps.count);
+                  c.textLabel.text = tidy ? @"🧹 Навести порядок" : @"↩︎ Вернуть как было";
+                  c.textLabel.textColor = tidy ? self.view.tintColor : UIColor.systemOrangeColor;
+                  return c;
+              }
               UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
               c.textLabel.text = @"Респринг";
               c.textLabel.textColor = UIColor.systemRedColor;
@@ -833,9 +1052,46 @@ jobs:
                           notify_post("com.local.dynisland/preview");
                       });
                   }
-              } else if (ip.section == 3) {
+              } else if (ip.section == 4) {
+                  NSInteger n = AppleApps().count;
+                  if (ip.row == n) [self confirmTidy];
+                  else if (ip.row == n + 1) [self confirmRestore];
+              } else if (ip.section == 5) {
                   Respring();
               }
+          }
+
+          - (void)alert:(NSString *)title message:(NSString *)msg {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+              [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)confirmTidy {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Навести порядок?"
+                  message:@"Лишние Apple-приложения переедут в папку «Ненужное», потом телефон перезапустит оболочку."
+                  preferredStyle:UIAlertControllerStyleAlert];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Перенести" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                  NSInteger cnt = 0;
+                  NSString *err = Tidy(&cnt);
+                  if (err) { [self alert:@"Готово" message:err]; return; }
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Respring(); });
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
+          }
+
+          - (void)confirmRestore {
+              UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Вернуть прежнюю раскладку?"
+                  message:@"Домашний экран станет таким, каким был до первого наведения порядка."
+                  preferredStyle:UIAlertControllerStyleAlert];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+              [ac addAction:[UIAlertAction actionWithTitle:@"Вернуть" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                  NSString *err = RestoreLayout();
+                  if (err) { [self alert:@"Не вышло" message:err]; return; }
+                  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ Respring(); });
+              }]];
+              [self presentViewController:ac animated:YES completion:nil];
           }
 
           - (void)styleChanged:(UISegmentedControl *)seg {
@@ -845,7 +1101,7 @@ jobs:
           }
 
           - (void)sliderChanged:(UISlider *)s {
-              NSString *key = (s.tag == 1) ? @"glassBrightness" : (s.tag == 2) ? @"yOffset" : @"showDuration";
+              NSString *key = (s.tag == 1) ? @"glassBrightness" : (s.tag == 2) ? @"yOffset" : (s.tag == 4) ? @"iconGlassStrength" : @"showDuration";
               double v = s.value;
               if (s.tag == 2) v = round(v);
               gP[key] = @(v);
@@ -854,6 +1110,16 @@ jobs:
           }
 
           - (void)switchChanged:(UISwitch *)sw {
+              if (sw.tag >= 100) {
+                  NSArray *apps = AppleApps();
+                  NSString *bid = apps[sw.tag - 100][1];
+                  NSMutableSet *keep = [KeepSet() mutableCopy];
+                  if (sw.on) [keep addObject:bid]; else [keep removeObject:bid];
+                  gP[@"keepApps"] = keep.allObjects;
+                  PSave();
+                  return;
+              }
+              if (sw.tag == 20) { gP[@"iconGlass"] = @(sw.on); PSave(); return; }
               NSString *key = (sw.tag == 10) ? @"showBattery" : (sw.tag == 11) ? @"showMusic" : @"showRecording";
               gP[key] = @(sw.on);
               PSave();
@@ -896,8 +1162,8 @@ jobs:
           	<key>CFBundleName</key><string>DynIsland</string>
           	<key>CFBundleDisplayName</key><string>DynIsland</string>
           	<key>CFBundlePackageType</key><string>APPL</string>
-          	<key>CFBundleShortVersionString</key><string>0.3.0</string>
-          	<key>CFBundleVersion</key><string>0.3.0</string>
+          	<key>CFBundleShortVersionString</key><string>0.4.0</string>
+          	<key>CFBundleVersion</key><string>0.4.0</string>
           	<key>LSRequiresIPhoneOS</key><true/>
           	<key>MinimumOSVersion</key><string>15.0</string>
           	<key>UIDeviceFamily</key><array><integer>1</integer></array>
@@ -983,7 +1249,6 @@ jobs:
           python3 icon.py
           rm icon.py
 
-          # default exit animation (chosen in the workflow dialog)
           sed -i '' "s/__DEFAULT_ANIM__/$ANIM/" tweak/Tweak.x app/main.m
 
       - name: Build
